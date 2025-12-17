@@ -1,6 +1,6 @@
-# Анализатор прямого трафика Apache логов
+# Анализатор прямого трафика Apache/Nginx логов
 
-Скрипт `analyze_direct_traffic.py` анализирует access-логи Apache (Combined Log Format), находит прямые заходы, считает отказы, выявляет подозрительные IP/User-Agent и формирует Excel-отчёт.
+Скрипт `analyze_direct_traffic.py` анализирует access-логи Apache/Nginx (Combined Log Format), находит прямые заходы, считает отказы, выявляет подозрительные IP/User-Agent и формирует Excel-отчёт.
 
 ## Требования
 - Python 3.9+
@@ -33,6 +33,7 @@ python analyze_direct_traffic.py <путь_к_логу_или_директори
 
 ## Что делает скрипт
 1) Парсит логи (один файл или все access-файлы в директории).  
+   Поддерживаются Apache Combined и стандартный Nginx combined (`$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"`).  
 2) Определяет домен (если не указан): сначала по именам логов, потом по referer-ам, иначе берёт дефолт.  
 3) Выделяет прямой трафик (пустой/“-” referer или не содержит домен). Исключает ботов и статические ресурсы.  
 4) Считает отказы: сессия IP+UA с ≤1 успешным (200) запросом.  
