@@ -1,12 +1,13 @@
 """
 Анализатор логов для выявления подозрительных источников прямого трафика.
-Анализирует Apache access logs и выявляет паттерны, связанные с ростом отказов.
+Анализирует Apache/Nginx access logs и выявляет паттерны, связанные с ростом отказов.
 
 Версия: 1.0
 Автор: NickRudoy
 """
 
 import re
+import gzip
 import pandas as pd
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
@@ -363,9 +364,9 @@ class LogParser:
 class DirectTrafficAnalyzer:
     """Анализатор прямого трафика"""
     
-    def __init__(self, log_path, domain='auto', start_date=None, end_date=None, use_geoip=True):
+    def __init__(self, log_path, domain='auto', start_date=None, end_date=None, use_geoip=True, log_files=None):
         self.log_path = Path(log_path)
-        self.log_files = self._resolve_log_files(self.log_path)
+        self.log_files = [Path(p) for p in log_files] if log_files else self._resolve_log_files(self.log_path)
         self.domain_input = domain
         self.domain = domain if domain not in (None, 'auto') else None
         self.domain_source = 'аргумент --domain' if self.domain else 'auto'
@@ -387,7 +388,7 @@ class DirectTrafficAnalyzer:
         if log_path.is_dir():
             access_files = sorted([
                 p for p in log_path.iterdir()
-                if p.is_file() and 'access' in p.name.lower()
+                if p.is_file() and 'access' in p.name.lower() and (p.suffix in {'', '.log', '.gz', '.txt'} or True)
             ])
             if not access_files:
                 print(f"Ошибка: в директории {log_path} нет access-логов для анализа")
@@ -475,6 +476,11 @@ class DirectTrafficAnalyzer:
         safe = safe.strip('._-')
         return safe or 'site'
         
+    def _open_log(self, log_file):
+        if log_file.suffix == '.gz':
+            return gzip.open(log_file, 'rt', encoding='utf-8', errors='ignore')
+        return open(log_file, 'r', encoding='utf-8', errors='ignore')
+    
     def parse_logs(self):
         """Парсит логи из файла"""
         print(f"Парсинг логов из {self.log_path}...")
@@ -491,7 +497,7 @@ class DirectTrafficAnalyzer:
         for file_index, log_file in enumerate(self.log_files, 1):
             print(f"\n[{file_index}/{len(self.log_files)}] Файл: {log_file}")
             try:
-                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                with self._open_log(log_file) as f:
                     for line_num, line in enumerate(f, 1):
                         line = line.strip()
                         if not line:
@@ -1074,31 +1080,53 @@ def main():
             sys.exit(1)
     
     resolved_path = resolve_log_path(args.log_path)
+    # Получаем список файлов (без учёта домена) для группировки
+    temp_analyzer = DirectTrafficAnalyzer(resolved_path, args.domain, start_date, end_date, use_geoip=not args.no_geoip)
+    all_files = temp_analyzer.log_files
     
-    analyzer = DirectTrafficAnalyzer(resolved_path, args.domain, start_date, end_date, use_geoip=not args.no_geoip)
+    def extract_domain_from_name(path_obj):
+        name = path_obj.name.lower()
+        candidates = re.findall(r'([a-z0-9-]+(?:\.[a-z0-9-]+){1,})', name)
+        for candidate in candidates:
+            labels = candidate.split('.')
+            while labels and (labels[-1] in {'log', 'access', 'error', 'gz', 'txt'} or labels[-1].isdigit()):
+                labels.pop()
+            if len(labels) >= 2:
+                return '.'.join(labels)
+        return None
     
-    # Парсинг логов
-    analyzer.parse_logs()
+    # Если домен задан явно — анализируем все файлы одним запуском
+    if args.domain not in (None, 'auto'):
+        analyzer = DirectTrafficAnalyzer(resolved_path, args.domain, start_date, end_date, use_geoip=not args.no_geoip, log_files=all_files)
+        analyzer.parse_logs()
+        analyzer.ensure_domain()
+        analyzer.identify_direct_traffic()
+        bounce_analysis = analyzer.analyze_bounce_rate()
+        suspicious_patterns = analyzer.find_suspicious_patterns(bounce_analysis['bounce_entries'])
+        analyzer.print_summary(bounce_analysis, suspicious_patterns)
+        report_file = analyzer.generate_report(bounce_analysis, suspicious_patterns)
+        print(f"\nАнализ завершен! Отчет сохранен в {report_file}")
+        return
     
-    # Определение домена (если не передан явно)
-    analyzer.ensure_domain()
+    # Авто-разбиение по доменам из имён файлов
+    domain_groups = {}
+    for f in all_files:
+        domain_candidate = extract_domain_from_name(f)
+        domain_key = domain_candidate or 'unknown'
+        domain_groups.setdefault(domain_key, []).append(f)
     
-    # Определение прямого трафика
-    analyzer.identify_direct_traffic()
-    
-    # Анализ отказов
-    bounce_analysis = analyzer.analyze_bounce_rate()
-    
-    # Поиск подозрительных паттернов
-    suspicious_patterns = analyzer.find_suspicious_patterns(bounce_analysis['bounce_entries'])
-    
-    # Вывод сводки
-    analyzer.print_summary(bounce_analysis, suspicious_patterns)
-    
-    # Генерация отчета
-    report_file = analyzer.generate_report(bounce_analysis, suspicious_patterns)
-    
-    print(f"\nАнализ завершен! Отчет сохранен в {report_file}")
+    # Если найдено несколько доменов — отдельный отчёт на каждый
+    for domain_key, files in domain_groups.items():
+        print(f"\n=== Анализ домена: {domain_key} ===")
+        analyzer = DirectTrafficAnalyzer(resolved_path, domain_key if domain_key != 'unknown' else 'auto', start_date, end_date, use_geoip=not args.no_geoip, log_files=files)
+        analyzer.parse_logs()
+        analyzer.ensure_domain()
+        analyzer.identify_direct_traffic()
+        bounce_analysis = analyzer.analyze_bounce_rate()
+        suspicious_patterns = analyzer.find_suspicious_patterns(bounce_analysis['bounce_entries'])
+        analyzer.print_summary(bounce_analysis, suspicious_patterns)
+        report_file = analyzer.generate_report(bounce_analysis, suspicious_patterns)
+        print(f"\nАнализ завершен! Отчет сохранен в {report_file}")
 
 
 if __name__ == '__main__':
