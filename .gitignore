@@ -24,3 +24,5 @@ __pycache__/
 *.php
 *.sql
 *.ods
+*.docx
+*.txt
