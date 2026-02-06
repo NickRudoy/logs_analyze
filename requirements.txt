@@ -15,3 +15,6 @@ soupsieve
 typing_extensions
 tzdata
 urllib3
+gigachat
+python-docx
+pyyaml
