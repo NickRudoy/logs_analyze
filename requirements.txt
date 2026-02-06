@@ -10,6 +10,7 @@ pandas
 python-dateutil
 pytz
 requests
+geoip2
 six
 soupsieve
 typing_extensions

@@ -48,6 +48,33 @@ echo -e "${GREEN}Установка зависимостей в $VENV_DIR...${NC
 ./$VENV_DIR/bin/pip install --upgrade pip
 ./$VENV_DIR/bin/pip install -r requirements.txt
 
+# Опционально: загрузка GeoLite2-City для быстрой геолокации (пропустить: ./setup.sh --no-geoip-db)
+GEOIP_DIR="geoip"
+GEOIP_FILE="$GEOIP_DIR/GeoLite2-City.mmdb"
+GEOIP_MIRROR="https://github.com/Skiddle-ID/geoip2-mirror/releases/latest/download/GeoLite2-City.mmdb"
+
+if [[ "$1" != "--no-geoip-db" ]]; then
+    echo -e "${GREEN}Загрузка GeoLite2-City.mmdb (локальная геолокация без API)...${NC}"
+    mkdir -p "$GEOIP_DIR"
+    if command -v curl &> /dev/null; then
+        if curl -sL -f -o "$GEOIP_FILE" "$GEOIP_MIRROR" 2>/dev/null; then
+            echo -e "${GREEN}GeoLite2-City загружен в $GEOIP_FILE${NC}"
+        else
+            echo -e "${BLUE}Не удалось загрузить (сеть/зеркало). Используйте: --no-geoip или скачайте вручную с MaxMind.${NC}"
+            rm -f "$GEOIP_FILE" 2>/dev/null
+        fi
+    elif command -v wget &> /dev/null; then
+        if wget -q -O "$GEOIP_FILE" "$GEOIP_MIRROR" 2>/dev/null; then
+            echo -e "${GREEN}GeoLite2-City загружен в $GEOIP_FILE${NC}"
+        else
+            echo -e "${BLUE}Не удалось загрузить. Используйте: --no-geoip или скачайте вручную.${NC}"
+            rm -f "$GEOIP_FILE" 2>/dev/null
+        fi
+    else
+        echo -e "${BLUE}Для автозагрузки GeoIP нужен curl или wget. Скачайте GeoLite2-City вручную.${NC}"
+    fi
+fi
+
 echo -e "${GREEN}Установка завершена!${NC}"
 echo ""
 echo -e "${BLUE}Как запустить:${NC}"
@@ -63,3 +90,7 @@ echo ""
 echo "  3. Анализ с AI (нужен ключ):"
 echo "     ./$VENV_DIR/bin/python3 main.py logs/ --ai --auth-key <YOUR_KEY>"
 echo ""
+if [[ -f "geoip/GeoLite2-City.mmdb" ]]; then
+echo -e "${GREEN}  4. С GeoIP (если загружен): --mmdb geoip/GeoLite2-City.mmdb${NC}"
+echo ""
+fi

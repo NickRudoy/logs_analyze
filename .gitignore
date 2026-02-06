@@ -3,6 +3,7 @@ venv/
 ai_env/
 logs/
 results/
+geoip/
 __pycache__/
 *.pyc
 *.pyo

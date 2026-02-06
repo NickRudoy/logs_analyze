@@ -15,7 +15,8 @@ DEFAULT_CONFIG = {
     },
     "geoip": {
         "enabled": True,
-        "api_delay": 0.2
+        "api_delay": 0.2,
+        "mmdb_path": "geoip/GeoLite2-City.mmdb"  # Путь к .mmdb (setup.sh загружает в geoip/ если не --no-geoip-db)
     },
     "ai": {
         "enabled": False,

@@ -15,11 +15,12 @@ except ImportError:
 from .parser import LogParser
 from .geoip import GeoIPAnalyzer
 from .user_agent import UserAgentAnalyzer
+from .db import DBManager
 
 class DirectTrafficAnalyzer:
     """Анализатор прямого трафика"""
     
-    def __init__(self, log_path, domain='auto', start_date=None, end_date=None, use_geoip=True, log_files=None, verbose=False):
+    def __init__(self, log_path, domain='auto', start_date=None, end_date=None, use_geoip=True, log_files=None, verbose=False, mmdb_path=None):
         self.log_path = Path(log_path)
         self.log_files = [Path(p) for p in log_files] if log_files else self._resolve_log_files(self.log_path)
         self.domain_input = domain
@@ -29,10 +30,17 @@ class DirectTrafficAnalyzer:
         self.end_date = end_date
         self.use_geoip = use_geoip
         self.verbose = verbose
-        self.entries = []
-        self.direct_traffic = []
-        self.geo_analyzer = GeoIPAnalyzer(use_api=use_geoip, verbose=verbose) if use_geoip else None
+        # self.entries ubran - ispolzuem DB
+        self.db = None
+        self.total_records = 0  # Set after parse_logs
+        self.direct_traffic = []  # Vremenno ostavlayem dlya sovmestimosti
+        self.geo_analyzer = GeoIPAnalyzer(use_api=use_geoip, verbose=verbose, mmdb_path=mmdb_path) if use_geoip else None
         self.ua_analyzer = UserAgentAnalyzer()
+        
+    def init_db(self, db_path):
+        """Inicializaciya BD"""
+        self.db = DBManager(db_path)
+        self.db.connect()
     
     def _resolve_log_files(self, log_path):
         """Определяет список файлов для анализа"""
@@ -79,16 +87,29 @@ class DirectTrafficAnalyzer:
         return domains
     
     def _infer_domain_from_referers(self):
-        """Пытается определить домен сайта по referer-ам"""
+        """Пытается определить домен сайта по referer-ам (сэмплирование из лог-файлов)"""
         hosts = []
-        for entry in self.entries:
-            ref = entry.get('referer', '')
-            if not ref or ref == '-':
+        max_lines = 10000  # Ограничение для быстрого сэмплинга
+        for log_file in self.log_files:
+            try:
+                with self._open_log(log_file) as f:
+                    for i, line in enumerate(f):
+                        if i >= max_lines:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        entry = LogParser.parse_line(line)
+                        if entry:
+                            ref = entry.get('referer', '')
+                            if not ref or ref == '-':
+                                continue
+                            parsed = urlparse(ref)
+                            host = parsed.hostname
+                            if host and not self._is_ip(host):
+                                hosts.append(host.lower())
+            except Exception:
                 continue
-            parsed = urlparse(ref)
-            host = parsed.hostname
-            if host and not self._is_ip(host):
-                hosts.append(host.lower())
         return hosts
     
     def _infer_domain(self):
@@ -129,7 +150,10 @@ class DirectTrafficAnalyzer:
         return open(log_file, 'r', encoding='utf-8', errors='ignore')
     
     def parse_logs(self):
-        """Парсит логи из файла"""
+        """Парсит логи и сохраняет в БД"""
+        if not self.db:
+            raise RuntimeError("Database not initialized")
+            
         print(f"Парсинг логов из {self.log_path}...")
         print(f"Найдено файлов для анализа: {len(self.log_files)}")
         
@@ -140,7 +164,10 @@ class DirectTrafficAnalyzer:
         
         parsed_count = 0
         skipped_count = 0
+        batch = []
+        BATCH_SIZE = 5000
         
+        # Фаза 1: парсинг и сохранение БЕЗ GeoIP (быстро)
         for file_index, log_file in enumerate(self.log_files, 1):
             print(f"\n[{file_index}/{len(self.log_files)}] Файл: {log_file}")
             try:
@@ -158,13 +185,20 @@ class DirectTrafficAnalyzer:
                             if self.end_date and entry['timestamp'] > self.end_date:
                                 skipped_count += 1
                                 continue
-                            self.entries.append(entry)
+                            
+                            # GeoIP не в цикле — делаем после для уникальных IP
+                            batch.append(entry)
                             parsed_count += 1
+                            
+                            if len(batch) >= BATCH_SIZE:
+                                self.db.insert_batch(batch)
+                                batch = []
                         else:
                             skipped_count += 1
                         
                         if line_num % 10000 == 0:
-                            print(f"  Обработано строк: {line_num:,} | Всего распознано записей: {parsed_count:,}")
+                            print(f"  Обработано строк: {line_num:,} | Сохранено записей: {parsed_count:,}")
+                            
             except FileNotFoundError:
                 print(f"Ошибка: файл {log_file} не найден")
                 sys.exit(1)
@@ -172,33 +206,87 @@ class DirectTrafficAnalyzer:
                 print(f"Ошибка при чтении файла {log_file}: {e}")
                 sys.exit(1)
         
-        print(f"\nВсего записей: {len(self.entries):,}")
+        if batch:
+            self.db.insert_batch(batch)
+        
+        self.total_records = parsed_count
+        print(f"\nВсего записей сохранено в БД: {parsed_count:,}")
         if skipped_count > 0:
-            print(f"Пропущено нераспознанных строк: {skipped_count:,}")
+            print(f"Пропущено (фильтр/ошибки): {skipped_count:,}")
+        
+        # Фаза 2: GeoIP. Порядок: данные из БД → локальная .mmdb → API.
+        if self.use_geoip and self.geo_analyzer:
+            # Предзаполняем кэш данными из БД (повторные запуски)
+            for ip, country, provider in self.db.get_ips_with_geo():
+                self.geo_analyzer.cache[ip] = {
+                    'country': country, 'country_code': 'XX', 'city': 'Unknown',
+                    'isp': provider or 'Unknown', 'ip_type': 'Unknown', 'is_datacenter': False
+                }
+            unique_ips = self.db.get_distinct_ips_without_geo()
+            total_ips = len(self.db.get_distinct_ips())
+            skipped = total_ips - len(unique_ips)
+            if skipped:
+                print(f"\nGeoIP: {skipped:,} IP уже в БД, обрабатываем {len(unique_ips):,} (локальная .mmdb → API)...")
+            else:
+                print(f"\nGeoIP: обработка {len(unique_ips):,} IP (локальная .mmdb → API)...")
+            if unique_ips:
+                for i, ip in enumerate(unique_ips, 1):
+                    ip_info = self.geo_analyzer.get_ip_info(ip)
+                    self.db.update_geo_for_ip(ip, ip_info.get('country'), ip_info.get('isp'))
+                    if self.verbose and i % 1000 == 0:
+                        print(f"  GeoIP: {i:,}/{len(unique_ips):,}")
+                print(f"GeoIP: готово ({self.geo_analyzer.success_count} успешно)")
+            else:
+                print("GeoIP: все IP уже имеют геолокацию в БД.")
         
     def identify_direct_traffic(self):
-        """Определяет прямые заходы (direct traffic)"""
+        """Определяет прямые заходы (direct traffic) используя SQL"""
         print("\nОпределение прямого трафика...")
         
-        for entry in self.entries:
-            referer = entry['referer']
-            is_direct = (
-                referer == '-' or 
-                referer == '' or
-                self.domain not in referer.lower()
-            )
-            
-            if is_direct:
-                user_agent = entry['user_agent'].lower()
-                if any(bot in user_agent for bot in ['bot', 'crawler', 'spider', 'googlebot', 'yandex', 'bing']):
-                    continue
-                
-                url = entry['url'].lower()
-                if any(resource in url for resource in ['/wp-content/', '/wp-includes/', '/wp-json/', '/wp-cron', '/wp-admin/', '.css', '.js', '.jpg', '.png', '.gif', '.ico', '.svg']):
-                    continue
-                
-                self.direct_traffic.append(entry)
+        # SQL logic: referer is empty/dash OR domain not in referer
+        # AND NOT bot
+        # AND NOT static resource
         
+        # For simplicity, we fetch potential direct visits and filter python-side for complex regexes if needed, 
+        # but SQLite LIKE is powerful enough for basic filters.
+        
+        # 1. Fetch entries that might be direct
+        domain_pattern = f"%{self.domain}%"
+        
+        query = """
+        SELECT * FROM logs 
+        WHERE (referer IS NULL OR referer = '' OR referer = '-')
+        AND user_agent NOT LIKE '%bot%' 
+        AND user_agent NOT LIKE '%crawler%'
+        AND user_agent NOT LIKE '%spider%'
+        AND user_agent NOT LIKE '%google%'
+        AND user_agent NOT LIKE '%yandex%'
+        AND user_agent NOT LIKE '%bing%'
+        """
+        
+        cursor = self.db.execute_query(query)
+        candidates = []
+        columns = [col[0] for col in cursor.description]
+        
+        for row in cursor:
+            # Convert row to dict
+            entry = dict(zip(columns, row))
+            
+            # Additional Python-side filtering for complex URLs (static resources)
+            url = entry['url'].lower()
+            if any(resource in url for resource in ['/wp-content/', '/wp-includes/', '/wp-json/', '/wp-cron', '/wp-admin/', '.css', '.js', '.jpg', '.png', '.gif', '.ico', '.svg']):
+                continue
+            
+            # Parse timestamp string from DB back to datetime object
+            if isinstance(entry['timestamp'], str):
+                try:
+                    entry['timestamp'] = datetime.fromisoformat(entry['timestamp'])
+                except:
+                    pass
+                    
+            candidates.append(entry)
+            
+        self.direct_traffic = candidates
         print(f"Прямых заходов: {len(self.direct_traffic)}")
         
     def analyze_bounce_rate(self):
@@ -435,16 +523,29 @@ class DirectTrafficAnalyzer:
         return period_data
     
     def analyze_load_periods(self, window_minutes=15, threshold_percentile=75):
-        """Анализирует периоды высокой нагрузки"""
+        """Анализирует периоды высокой нагрузки используя SQL"""
         print(f"\nАнализ периодов нагрузки (окно: {window_minutes} минут)...")
         
-        if not self.entries:
-            return {
-                'high_load_periods': [],
-                'normal_load_periods': [],
-                'anomalies': [],
-                'comparison': {}
-            }
+        # 1. Check if we have logs
+        try:
+            count = self.db.execute_query("SELECT count(*) FROM logs").fetchone()[0]
+            if count == 0:
+                print("Нет данных для анализа нагрузки")
+                return None
+        except:
+             return None
+
+        # Since SQLite date functions can be tricky with ISO strings, 
+        # and we need windowing specific to minutes.
+        # It might be easier to fetch ALL timestamps first (lightweight), calculate histograms in Python, 
+        # OR use python to iterate windows if data is huge.
+        
+        # For now, let's fetch all (timestamp, ip, status, etc) - minimal columns
+        # effectively reconstructing 'entries' but only with needed columns for load analysis
+        
+        print("Загрузка данных для анализа нагрузки...")
+        query = "SELECT timestamp, ip, url, status, size, user_agent, method FROM logs"
+        cursor = self.db.execute_query(query)
         
         window_stats = defaultdict(lambda: {
             'count': 0,
@@ -455,31 +556,33 @@ class DirectTrafficAnalyzer:
             'urls': Counter(),
             'user_agents': Counter(),
             'methods': Counter(),
-            'total_size': 0,
-            'entries': []
+            'total_size': 0
         })
         
-        for entry in self.entries:
-            timestamp = entry['timestamp']
+        for row in cursor:
+            ts_str, ip, url, status, size, ua, method = row
+            try:
+                timestamp = datetime.fromisoformat(ts_str)
+            except:
+                continue
+                
             minutes = timestamp.minute
             window_start_minute = (minutes // window_minutes) * window_minutes
             window_key = timestamp.replace(minute=window_start_minute, second=0, microsecond=0)
             
             stats = window_stats[window_key]
             stats['count'] += 1
-            stats['unique_ips'].add(entry['ip'])
-            stats['unique_urls'].add(entry['url'])
-            stats['status_codes'][entry['status']] += 1
-            stats['ips'][entry['ip']] += 1
-            stats['urls'][entry['url']] += 1
-            stats['user_agents'][entry['user_agent']] += 1
-            stats['methods'][entry['method']] += 1
+            stats['unique_ips'].add(ip)
+            stats['unique_urls'].add(url)
+            stats['status_codes'][status] += 1
+            stats['ips'][ip] += 1
+            stats['urls'][url] += 1
+            stats['user_agents'][ua] += 1
+            stats['methods'][method] += 1
             try:
-                size = int(entry['size']) if entry['size'] != '-' else 0
                 stats['total_size'] += size
             except:
                 pass
-            stats['entries'].append(entry)
         
         request_counts = [stats['count'] for stats in window_stats.values()]
         if not request_counts:
@@ -653,7 +756,8 @@ class DirectTrafficAnalyzer:
         print("="*50)
         
         print(f"\nАнализ для домена: {self.domain} (источник: {self.domain_source})")
-        print(f"Всего записей обработано: {len(self.entries)}")
+        total = self.total_records if self.total_records else (self.db.execute_query("SELECT COUNT(*) FROM logs").fetchone()[0] if self.db else 0)
+        print(f"Всего записей обработано: {total:,}")
         
         print("\nОТКАЗЫ (BOUNCE RATE)")
         print(f"Всего прямых заходов: {bounce_analysis['total_direct']}")

@@ -56,6 +56,12 @@
 ./venv/bin/python3 main.py logs/ --ai --auth-key <ВАШ_КЛЮЧ>
 ```
 
+### 4. Быстрая геолокация (GeoIP2/GeoLite2)
+При запуске `./setup.sh` автоматически загружается GeoLite2-City в папку `geoip/`. Конфиг по умолчанию указывает на `geoip/GeoLite2-City.mmdb` — геолокация работает сразу без API.
+
+- Пропустить загрузку при setup: `./setup.sh --no-geoip-db`
+- Указать свой путь: `./venv/bin/python3 main.py logs/ --mmdb /путь/к/GeoLite2-City.mmdb`
+
 ## Структура проекта
 
 *   `main.py`: Точка входа в программу.

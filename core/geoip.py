@@ -1,26 +1,82 @@
 import time
+from pathlib import Path
+
 try:
     import requests
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
 
+try:
+    import geoip2.database
+    HAS_GEOIP2 = True
+except ImportError:
+    HAS_GEOIP2 = False
+
+
 class GeoIPAnalyzer:
-    """Анализатор геолокации и информации об IP"""
+    """Анализатор геолокации и информации об IP.
     
-    def __init__(self, use_api=True, verbose=False):
+    Порядок проверки:
+    1. Локальная GeoIP2/GeoLite2 (.mmdb) — мгновенно, без лимитов
+    2. Внешний API (ip-api.com и др.) — при отсутствии в .mmdb
+    """
+    
+    def __init__(self, use_api=True, verbose=False, mmdb_path=None):
         self.use_api = use_api and HAS_REQUESTS
-        self.cache = {}  # Кэш для уже проверенных IP
-        self.api_delay = 0.2  # Задержка между запросами к API (секунды)
+        self.mmdb_path = Path(mmdb_path) if mmdb_path else None
+        self._reader = None  # GeoIP2 reader (lazy init)
+        self.cache = {}
+        self.api_delay = 0.2
         self.last_request_time = 0
         self.verbose = verbose
         self.error_count = 0
         self.success_count = 0
         
+    def _get_reader(self):
+        """Ленивая инициализация GeoIP2 reader"""
+        if self._reader is not None:
+            return self._reader
+        if HAS_GEOIP2 and self.mmdb_path and self.mmdb_path.exists():
+            try:
+                self._reader = geoip2.database.Reader(str(self.mmdb_path))
+                if self.verbose:
+                    print(f"Используется локальная GeoIP БД: {self.mmdb_path}")
+                return self._reader
+            except Exception as e:
+                if self.verbose:
+                    print(f"Ошибка загрузки GeoIP БД {self.mmdb_path}: {e}")
+        return None
+        
     def get_ip_info(self, ip):
-        """Получает информацию об IP: страна, город, провайдер, тип"""
+        """Получает информацию об IP: страна, город, провайдер, тип.
+        Сначала проверяет локальную .mmdb, затем API (если включён).
+        """
         if ip in self.cache:
             return self.cache[ip]
+        
+        # 1. Локальная GeoIP2/GeoLite2 БД (мгновенно)
+        reader = self._get_reader()
+        if reader:
+            try:
+                r = reader.city(ip)
+                ip_info = {
+                    'country': r.country.name or 'Unknown',
+                    'country_code': r.country.iso_code or 'XX',
+                    'city': r.city.name or 'Unknown',
+                    'isp': (r.traits.isp or r.traits.organization or 'Unknown') if hasattr(r, 'traits') else 'Unknown',
+                    'ip_type': 'Unknown',
+                    'is_datacenter': self._is_datacenter(
+                        getattr(r.traits, 'isp', '') or '',
+                        getattr(r.traits, 'organization', '') or ''
+                    ) if hasattr(r, 'traits') else False
+                }
+                self.cache[ip] = ip_info
+                self.success_count += 1
+                return ip_info
+            except Exception as e:
+                if self.verbose and self.error_count <= 3:
+                    print(f"GeoIP2 lookup для {ip}: {e}")
         
         if not self.use_api:
             if self.verbose:
