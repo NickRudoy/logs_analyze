@@ -15,11 +15,12 @@ except ImportError:
 from .parser import LogParser
 from .geoip import GeoIPAnalyzer
 from .user_agent import UserAgentAnalyzer
+from . import cache as cache_mod
 
 class DirectTrafficAnalyzer:
     """Анализатор прямого трафика"""
     
-    def __init__(self, log_path, domain='auto', start_date=None, end_date=None, use_geoip=True, log_files=None, verbose=False):
+    def __init__(self, log_path, domain='auto', start_date=None, end_date=None, use_geoip=True, log_files=None, verbose=False, max_entries=None, use_cache=True, cache_dir=None):
         self.log_path = Path(log_path)
         self.log_files = [Path(p) for p in log_files] if log_files else self._resolve_log_files(self.log_path)
         self.domain_input = domain
@@ -29,8 +30,12 @@ class DirectTrafficAnalyzer:
         self.end_date = end_date
         self.use_geoip = use_geoip
         self.verbose = verbose
+        self.max_entries = max_entries  # ограничение по числу записей (для экономии памяти)
+        self.use_cache = use_cache
+        self.cache_dir = cache_dir
         self.entries = []
-        self.direct_traffic = []
+        self.direct_traffic_count = 0
+        self.bounce_session_keys = set()
         self.geo_analyzer = GeoIPAnalyzer(use_api=use_geoip, verbose=verbose) if use_geoip else None
         self.ua_analyzer = UserAgentAnalyzer()
     
@@ -40,10 +45,15 @@ class DirectTrafficAnalyzer:
             return [log_path]
         if log_path.is_dir():
             all_files = [p for p in log_path.iterdir() if p.is_file()]
-            access_files = sorted([
-                p for p in all_files
-                if 'access' in p.name.lower() and (p.suffix in {'', '.log', '.gz', '.txt'} or True)
-            ])
+            def is_access_log(p):
+                name_lower = p.name.lower()
+                has_access = (
+                    'access' in name_lower
+                    or '-acc-' in name_lower
+                    or name_lower.endswith('-acc')
+                )
+                return has_access and (p.suffix in {'', '.log', '.gz', '.txt'} or True)
+            access_files = sorted([p for p in all_files if is_access_log(p)])
             skipped_logs = [p.name for p in all_files if ('log' in p.name.lower() or p.suffix == '.gz') and p not in access_files]
             if skipped_logs:
                 print(f"Пропущены (не access-логи, в отчёт не входят): {', '.join(sorted(skipped_logs))}")
@@ -69,7 +79,7 @@ class DirectTrafficAnalyzer:
             candidates = re.findall(r'([a-z0-9-]+(?:\.[a-z0-9-]+){1,})', name)
             for candidate in candidates:
                 labels = candidate.split('.')
-                while labels and (labels[-1] in {'log', 'access', 'error', 'gz', 'txt'} or labels[-1].isdigit()):
+                while labels and (labels[-1] in {'log', 'access', 'acc', 'error', 'gz', 'txt'} or labels[-1].isdigit()):
                     labels.pop()
                 if len(labels) < 2:
                     continue
@@ -127,9 +137,66 @@ class DirectTrafficAnalyzer:
         if log_file.suffix == '.gz':
             return gzip.open(log_file, 'rt', encoding='utf-8', errors='ignore')
         return open(log_file, 'r', encoding='utf-8', errors='ignore')
+
+    def _is_direct_entry(self, entry):
+        """Проверяет, является ли запись прямым заходом (с фильтром ботов/статических ресурсов)."""
+        referer = entry.get('referer', '')
+        is_direct = (
+            referer == '-'
+            or referer == ''
+            or self.domain not in referer.lower()
+        )
+        if not is_direct:
+            return False
+
+        user_agent = entry.get('user_agent', '').lower()
+        if any(bot in user_agent for bot in ['bot', 'crawler', 'spider', 'googlebot', 'yandex', 'bing']):
+            return False
+
+        url = entry.get('url', '').lower()
+        if any(resource in url for resource in ['/wp-content/', '/wp-includes/', '/wp-json/', '/wp-cron', '/wp-admin/', '.css', '.js', '.jpg', '.png', '.gif', '.ico', '.svg']):
+            return False
+        return True
     
+    def _flush_batch(self, batch, db_path):
+        if not batch:
+            return
+        cache_mod.insert_batch(db_path, batch)
+        batch.clear()
+
+    def _load_entries_from_cache(self):
+        """Загружает записи из SQLite-кэша в self.entries (батчами, с учётом max_entries)."""
+        cache_dir = cache_mod.get_cache_dir(self.log_path, self.cache_dir)
+        db_path = cache_mod.get_db_path(cache_dir)
+        total = cache_mod.count_entries(db_path)
+        if total == 0:
+            return
+        print(f"\nЗагрузка из кэша: {total:,} записей в БД.", end="")
+        limit = self.max_entries
+        if limit:
+            print(f" В память загружаем не более {limit:,} (--max-entries).")
+        else:
+            print(" Загружаем все в память (при OOM используйте --max-entries).")
+        load_count = 0
+        start_id = 0
+        batch_size = 500_000
+        while True:
+            batch, start_id = cache_mod.load_entries_batch(db_path, start_id=start_id, batch_size=batch_size)
+            if not batch:
+                break
+            for e in batch:
+                self.entries.append(e)
+                load_count += 1
+                if limit and load_count >= limit:
+                    break
+            if limit and load_count >= limit:
+                break
+            if start_id == 0:
+                break
+        print(f"Загружено записей в память: {len(self.entries):,}")
+
     def parse_logs(self):
-        """Парсит логи из файла"""
+        """Парсит логи; при use_cache пишет в SQLite и при повторном запуске пропускает уже обработанные файлы."""
         print(f"Парсинг логов из {self.log_path}...")
         print(f"Найдено файлов для анализа: {len(self.log_files)}")
         
@@ -137,15 +204,52 @@ class DirectTrafficAnalyzer:
             print(f"Фильтр: с {self.start_date.strftime('%Y-%m-%d')}")
         if self.end_date:
             print(f"Фильтр: по {self.end_date.strftime('%Y-%m-%d')}")
+        if self.max_entries:
+            print(f"Лимит записей: {self.max_entries:,} (для экономии памяти)")
+        
+        use_cache = self.use_cache and (self.log_path.is_dir() or self.log_path.is_file())
+        cache_dir = cache_mod.get_cache_dir(self.log_path, self.cache_dir) if use_cache else None
+        db_path = cache_mod.get_db_path(cache_dir) if use_cache else None
+        log_dir_abs = cache_mod._norm_path(self.log_path if self.log_path.is_dir() else self.log_path.parent)
+        if use_cache:
+            cache_mod.init_db(db_path)
+        progress = cache_mod.load_progress(cache_dir) if use_cache else None
+        completed_files = []
+        total_in_db = cache_mod.count_entries(db_path) if use_cache else 0
+        if use_cache and progress and progress.get("log_dir") == log_dir_abs:
+            completed_files = list(progress.get("completed_files", []))
+            incomplete = progress.get("current_file")
+            if incomplete:
+                n = int(progress.get("current_file_rows") or 0)
+                if n > 0:
+                    cache_mod.remove_last_n_rows(db_path, n)
+                    total_in_db = max(0, total_in_db - n)
+                    print(f"Удалено {n:,} записей незавершённого файла «{incomplete}» (повторный разбор).")
+                completed_files = [f for f in completed_files if f != incomplete]
+            if completed_files:
+                print(f"Кэш найден: уже обработано файлов: {len(completed_files)}. Пропуск этих файлов.")
         
         parsed_count = 0
         skipped_count = 0
+        batch = []
         
         for file_index, log_file in enumerate(self.log_files, 1):
+            if use_cache and log_file.name in completed_files:
+                print(f"\n[{file_index}/{len(self.log_files)}] Пропущен (в кэше): {log_file.name}")
+                continue
+            if self.max_entries and not use_cache and len(self.entries) >= self.max_entries:
+                print(f"\nДостигнут лимит --max-entries={self.max_entries:,}, парсинг остановлен.")
+                break
             print(f"\n[{file_index}/{len(self.log_files)}] Файл: {log_file}")
+            current_file_rows = 0
+            flushes_since_save = 0
+            if use_cache:
+                cache_mod.save_progress(cache_dir, log_dir_abs, completed_files, total_in_db, current_file=log_file.name, current_file_rows=0)
             try:
                 with self._open_log(log_file) as f:
                     for line_num, line in enumerate(f, 1):
+                        if self.max_entries and not use_cache and len(self.entries) >= self.max_entries:
+                            break
                         line = line.strip()
                         if not line:
                             continue
@@ -158,13 +262,36 @@ class DirectTrafficAnalyzer:
                             if self.end_date and entry['timestamp'] > self.end_date:
                                 skipped_count += 1
                                 continue
-                            self.entries.append(entry)
-                            parsed_count += 1
+                            if use_cache:
+                                batch.append(entry)
+                                if len(batch) >= cache_mod.BATCH_SIZE:
+                                    n = len(batch)
+                                    self._flush_batch(batch, db_path)
+                                    current_file_rows += n
+                                    total_in_db += n
+                                    flushes_since_save += 1
+                                    if flushes_since_save >= 5:
+                                        cache_mod.save_progress(cache_dir, log_dir_abs, completed_files, total_in_db, current_file=log_file.name, current_file_rows=current_file_rows)
+                                        flushes_since_save = 0
+                                parsed_count += 1
+                            else:
+                                self.entries.append(entry)
+                                parsed_count += 1
                         else:
                             skipped_count += 1
                         
                         if line_num % 10000 == 0:
                             print(f"  Обработано строк: {line_num:,} | Всего распознано записей: {parsed_count:,}")
+                    if use_cache:
+                        if batch:
+                            n = len(batch)
+                            self._flush_batch(batch, db_path)
+                            current_file_rows += n
+                            total_in_db += n
+                        completed_files.append(log_file.name)
+                        cache_mod.save_progress(cache_dir, log_dir_abs, completed_files, total_in_db, current_file=None, current_file_rows=0)
+                    if self.max_entries and not use_cache and len(self.entries) >= self.max_entries:
+                        break
             except FileNotFoundError:
                 print(f"Ошибка: файл {log_file} не найден")
                 sys.exit(1)
@@ -172,74 +299,83 @@ class DirectTrafficAnalyzer:
                 print(f"Ошибка при чтении файла {log_file}: {e}")
                 sys.exit(1)
         
-        print(f"\nВсего записей: {len(self.entries):,}")
+        if use_cache:
+            self._load_entries_from_cache()
+        print(f"\nВсего записей для анализа: {len(self.entries):,}")
         if skipped_count > 0:
             print(f"Пропущено нераспознанных строк: {skipped_count:,}")
         
     def identify_direct_traffic(self):
         """Определяет прямые заходы (direct traffic)"""
         print("\nОпределение прямого трафика...")
-        
-        for entry in self.entries:
-            referer = entry['referer']
-            is_direct = (
-                referer == '-' or 
-                referer == '' or
-                self.domain not in referer.lower()
-            )
-            
-            if is_direct:
-                user_agent = entry['user_agent'].lower()
-                if any(bot in user_agent for bot in ['bot', 'crawler', 'spider', 'googlebot', 'yandex', 'bing']):
-                    continue
-                
-                url = entry['url'].lower()
-                if any(resource in url for resource in ['/wp-content/', '/wp-includes/', '/wp-json/', '/wp-cron', '/wp-admin/', '.css', '.js', '.jpg', '.png', '.gif', '.ico', '.svg']):
-                    continue
-                
-                self.direct_traffic.append(entry)
-        
-        print(f"Прямых заходов: {len(self.direct_traffic)}")
+        self.direct_traffic_count = sum(1 for entry in self.entries if self._is_direct_entry(entry))
+        print(f"Прямых заходов: {self.direct_traffic_count}")
         
     def analyze_bounce_rate(self):
         """Анализирует отказы (bounce rate)"""
         print("\nАнализ отказов...")
-        
-        sessions = defaultdict(list)
-        
-        for entry in self.direct_traffic:
+        sessions = defaultdict(lambda: {'total': 0, 'ok200': 0})
+        daily_stats = defaultdict(lambda: {'total_requests': 0, 'direct': 0, 'bounces': 0})
+        for entry in self.entries:
+            day = entry['timestamp'].date().isoformat()
+            daily_stats[day]['total_requests'] += 1
+            if not self._is_direct_entry(entry):
+                continue
             key = f"{entry['ip']}|{entry['user_agent']}"
-            sessions[key].append(entry)
-        
-        bounces = []
-        non_bounces = []
-        
-        for key, session_entries in sessions.items():
-            session_entries.sort(key=lambda x: x['timestamp'])
-            successful_requests = [e for e in session_entries if e['status'] == 200]
-            
-            if len(successful_requests) <= 1:
-                bounces.extend(session_entries)
-            else:
-                non_bounces.extend(session_entries)
-        
-        bounce_rate = len(bounces) / len(self.direct_traffic) * 100 if self.direct_traffic else 0
-        
-        print(f"Отказов: {len(bounces)} ({bounce_rate:.2f}%)")
-        print(f"Не отказов: {len(non_bounces)} ({100 - bounce_rate:.2f}%)")
-        
+            sessions[key]['total'] += 1
+            if entry['status'] == 200:
+                sessions[key]['ok200'] += 1
+            daily_stats[day]['direct'] += 1
+
+        bounce_session_keys = {k for k, v in sessions.items() if v['ok200'] <= 1}
+        self.bounce_session_keys = bounce_session_keys
+
+        bounce_count = 0
+        bounce_samples = []
+        for entry in self.entries:
+            if not self._is_direct_entry(entry):
+                continue
+            key = f"{entry['ip']}|{entry['user_agent']}"
+            if key in bounce_session_keys:
+                bounce_count += 1
+                day = entry['timestamp'].date().isoformat()
+                daily_stats[day]['bounces'] += 1
+                if len(bounce_samples) < 1000:
+                    bounce_samples.append(entry)
+
+        total_direct = self.direct_traffic_count
+        non_bounces = max(0, total_direct - bounce_count)
+        bounce_rate = (bounce_count / total_direct * 100) if total_direct else 0
+
+        daily_rows = []
+        for day in sorted(daily_stats.keys()):
+            d = daily_stats[day]
+            day_bounce_rate = (d['bounces'] / d['direct'] * 100) if d['direct'] else 0
+            daily_rows.append({
+                'date': day,
+                'total_requests': d['total_requests'],
+                'direct': d['direct'],
+                'bounces': d['bounces'],
+                'bounce_rate': day_bounce_rate
+            })
+
+        print(f"Отказов: {bounce_count} ({bounce_rate:.2f}%)")
+        print(f"Не отказов: {non_bounces} ({100 - bounce_rate:.2f}%)")
+
         return {
-            'total_direct': len(self.direct_traffic),
-            'bounces': len(bounces),
-            'non_bounces': len(non_bounces),
+            'total_direct': total_direct,
+            'bounces': bounce_count,
+            'non_bounces': non_bounces,
             'bounce_rate': bounce_rate,
-            'bounce_entries': bounces,
-            'non_bounce_entries': non_bounces
+            'bounce_entries': bounce_samples,
+            'daily_stats': daily_rows,
+            'bounce_session_keys': bounce_session_keys,
         }
     
-    def find_suspicious_patterns(self, bounce_entries):
+    def find_suspicious_patterns(self, bounce_analysis):
         """Выявляет подозрительные паттерны"""
         print("\nПоиск подозрительных паттернов...")
+        bounce_session_keys = bounce_analysis.get('bounce_session_keys', set())
         
         initial_success = 0
         initial_errors = 0
@@ -256,16 +392,58 @@ class DirectTrafficAnalyzer:
             'country_stats': defaultdict(lambda: {'count': 0, 'ips': set()}),
             'datacenter_ips': []
         }
-        
-        ip_counter = Counter(e['ip'] for e in bounce_entries)
-        ip_sessions = defaultdict(list)
-        for entry in bounce_entries:
-            ip_sessions[entry['ip']].append(entry)
+
+        if not bounce_session_keys:
+            return suspicious
+
+        ip_counter = Counter()
+        ip_unique_urls = defaultdict(set)
+        ip_unique_uas = defaultdict(set)
+        ip_sample_urls = defaultdict(list)
+        ip_first_seen = {}
+        ip_last_seen = {}
+        ua_counter = Counter()
+        ua_unique_ips = defaultdict(set)
+        ua_sample_urls = defaultdict(set)
+        ip_timestamps = defaultdict(list)
+        error_counter = Counter()
+
+        for entry in self.entries:
+            if not self._is_direct_entry(entry):
+                continue
+            key = f"{entry['ip']}|{entry['user_agent']}"
+            if key not in bounce_session_keys:
+                continue
+
+            ip = entry['ip']
+            ua = entry['user_agent']
+            url = entry['url']
+            ts = entry['timestamp']
+            status = entry['status']
+
+            ip_counter[ip] += 1
+            ip_unique_urls[ip].add(url)
+            ip_unique_uas[ip].add(ua)
+            if len(ip_sample_urls[ip]) < 200:
+                ip_sample_urls[ip].append(url)
+            if ip not in ip_first_seen or ts < ip_first_seen[ip]:
+                ip_first_seen[ip] = ts
+            if ip not in ip_last_seen or ts > ip_last_seen[ip]:
+                ip_last_seen[ip] = ts
+
+            ua_counter[ua] += 1
+            ua_unique_ips[ua].add(ip)
+            if len(ua_sample_urls[ua]) < 50:
+                ua_sample_urls[ua].add(url)
+
+            if len(ip_timestamps[ip]) < 5000:
+                ip_timestamps[ip].append(ts)
+            if status >= 400:
+                error_counter[(ip, status)] += 1
         
         for ip, count in ip_counter.most_common(50):
-            sessions = ip_sessions[ip]
-            unique_urls = len(set(e['url'] for e in sessions))
-            unique_user_agents = len(set(e['user_agent'] for e in sessions))
+            unique_urls = len(ip_unique_urls[ip])
+            unique_user_agents = len(ip_unique_uas[ip])
             
             suspicious_score = 0
             reasons = []
@@ -282,7 +460,7 @@ class DirectTrafficAnalyzer:
                 suspicious_score += 1
                 reasons.append("Одинаковый user-agent")
             
-            urls = [e['url'] for e in sessions]
+            urls = ip_sample_urls[ip]
             if self._has_scanning_pattern(urls):
                 suspicious_score += 2
                 reasons.append("Паттерн сканирования")
@@ -307,12 +485,12 @@ class DirectTrafficAnalyzer:
                     'bounce_count': count,
                     'unique_urls': unique_urls,
                     'unique_user_agents': unique_user_agents,
-                    'user_agents': list(set(e['user_agent'] for e in sessions)),
+                    'user_agents': list(ip_unique_uas[ip])[:10],
                     'sample_urls': urls[:10],
                     'score': suspicious_score,
                     'reasons': reasons,
-                    'first_seen': min(e['timestamp'] for e in sessions),
-                    'last_seen': max(e['timestamp'] for e in sessions),
+                    'first_seen': ip_first_seen.get(ip, datetime.now()),
+                    'last_seen': ip_last_seen.get(ip, datetime.now()),
                     'country': ip_info.get('country', 'Unknown'),
                     'country_code': ip_info.get('country_code', 'XX'),
                     'city': ip_info.get('city', 'Unknown'),
@@ -321,15 +499,9 @@ class DirectTrafficAnalyzer:
                     'is_datacenter': ip_info.get('is_datacenter', False)
                 })
         
-        ua_counter = Counter(e['user_agent'] for e in bounce_entries)
-        ua_sessions = defaultdict(list)
-        for entry in bounce_entries:
-            ua_sessions[entry['user_agent']].append(entry)
-        
         for ua, count in ua_counter.most_common(30):
             if count > 5:
-                sessions = ua_sessions[ua]
-                unique_ips = len(set(e['ip'] for e in sessions))
+                unique_ips = len(ua_unique_ips[ua])
                 
                 if count > 10 or (unique_ips > 5 and count > 5):
                     ua_info = self.ua_analyzer.parse_user_agent(ua)
@@ -338,8 +510,8 @@ class DirectTrafficAnalyzer:
                         'user_agent': ua[:200],
                         'bounce_count': count,
                         'unique_ips': unique_ips,
-                        'sample_ips': list(set(e['ip'] for e in sessions))[:10],
-                        'sample_urls': list(set(e['url'] for e in sessions))[:10],
+                        'sample_ips': list(ua_unique_ips[ua])[:10],
+                        'sample_urls': list(ua_sample_urls[ua])[:10],
                         'browser': ua_info['browser'],
                         'browser_version': ua_info['browser_version'],
                         'os': ua_info['os'],
@@ -348,10 +520,6 @@ class DirectTrafficAnalyzer:
                         'is_bot': ua_info['is_bot'],
                         'is_mobile': ua_info['is_mobile']
                     })
-        
-        ip_timestamps = defaultdict(list)
-        for entry in bounce_entries:
-            ip_timestamps[entry['ip']].append(entry['timestamp'])
         
         for ip, timestamps in ip_timestamps.items():
             if len(timestamps) < 5:
@@ -369,9 +537,6 @@ class DirectTrafficAnalyzer:
                         'avg_interval_seconds': avg_diff,
                         'time_span': (timestamps[-1] - timestamps[0]).total_seconds()
                     })
-        
-        error_entries = [e for e in bounce_entries if e['status'] >= 400]
-        error_counter = Counter((e['ip'], e['status']) for e in error_entries)
         
         for (ip, status), count in error_counter.most_common(20):
             if count > 5:
@@ -455,8 +620,7 @@ class DirectTrafficAnalyzer:
             'urls': Counter(),
             'user_agents': Counter(),
             'methods': Counter(),
-            'total_size': 0,
-            'entries': []
+            'total_size': 0
         })
         
         for entry in self.entries:
@@ -479,7 +643,6 @@ class DirectTrafficAnalyzer:
                 stats['total_size'] += size
             except:
                 pass
-            stats['entries'].append(entry)
         
         request_counts = [stats['count'] for stats in window_stats.values()]
         if not request_counts:

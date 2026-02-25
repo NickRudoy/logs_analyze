@@ -161,20 +161,14 @@ class LogParser:
                     continue
                 
                 return {
-                    'hostname': hostname,
                     'ip': ip,
-                    'remote_user': remote_user,
-                    'auth_user': auth_user,
                     'timestamp': timestamp,
                     'method': method,
                     'url': url,
-                    'protocol': protocol,
                     'status': int(status),
                     'size': size if size != '-' else '0',
                     'referer': referer,
                     'user_agent': user_agent,
-                    'raw_line': line,
-                    'log_format': fmt
                 }
             except Exception as e:
                 continue

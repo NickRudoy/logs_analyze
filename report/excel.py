@@ -1,6 +1,128 @@
 
 import pandas as pd
 from datetime import datetime
+from pathlib import Path
+
+
+def _safe_int(val, default=0):
+    """Безопасное преобразование в int (pandas NaN/NA → default)."""
+    if pd.isna(val):
+        return default
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_str(val, default=''):
+    """Безопасное преобразование в str."""
+    if pd.isna(val):
+        return default
+    return str(val).strip() or default
+
+
+def load_excel_for_ai(excel_path: str) -> dict:
+    """Загружает данные из Excel-отчёта для передачи в AI анализатор.
+    
+    AI-отчёт строится на основании таблицы (Excel), а не сырых логов — 
+    это проще и позволяет генерировать AI-отчёт по уже готовому отчёту.
+    """
+    excel_path = Path(excel_path)
+    if not excel_path.exists():
+        raise FileNotFoundError(f"Файл не найден: {excel_path}")
+    
+    xl = pd.ExcelFile(excel_path)
+    
+    context = {
+        'summary': {},
+        'suspicious_ips': [],
+        'country_stats': [],
+        'datacenter_ips': [],
+        'load_anomalies': []
+    }
+    
+    # Сводка
+    if 'Сводка' in xl.sheet_names:
+        df = pd.read_excel(xl, sheet_name='Сводка')
+        if 'Метрика' in df.columns and 'Значение' in df.columns:
+            for _, row in df.iterrows():
+                m, v = row['Метрика'], row['Значение']
+                context['summary'][str(m)] = v
+            # Прямых заходов = отказов + не отказов
+            direct = context['summary'].get('Прямых заходов')
+            bounces = context['summary'].get('Отказов')
+            non_bounces = context['summary'].get('Не отказов')
+            if direct is not None or (bounces is not None and non_bounces is not None):
+                total = direct if direct is not None else (int(bounces or 0) + int(non_bounces or 0))
+                context['summary']['Всего записей в логе'] = total
+    
+    # Подозрительные IP
+    if 'Подозрительные IP' in xl.sheet_names:
+        df = pd.read_excel(xl, sheet_name='Подозрительные IP')
+        for _, row in df.iterrows():
+            reasons_raw = row.get('Причины', '')
+            reasons = str(reasons_raw).split('; ') if pd.notna(reasons_raw) and str(reasons_raw).strip() else []
+            context['suspicious_ips'].append({
+                'ip': _safe_str(row.get('IP'), ''),
+                'country': _safe_str(row.get('Страна'), 'Unknown'),
+                'country_code': _safe_str(row.get('Код страны'), 'XX'),
+                'city': _safe_str(row.get('Город'), 'Unknown'),
+                'isp': _safe_str(row.get('Провайдер'), 'Unknown'),
+                'ip_type': _safe_str(row.get('Тип IP'), 'Unknown'),
+                'is_datacenter': _safe_str(row.get('Датацентр'), 'Нет').lower() == 'да',
+                'bounce_count': _safe_int(row.get('Количество отказов')),
+                'unique_urls': _safe_int(row.get('Уникальных URL')),
+                'unique_user_agents': _safe_int(row.get('Уникальных User-Agent')),
+                'user_agents': [_safe_str(row.get('User-Agent'))[:200]],
+                'score': _safe_int(row.get('Оценка подозрительности')),
+                'reasons': reasons
+            })
+    
+    # Статистика по странам
+    if 'Статистика по странам' in xl.sheet_names:
+        df = pd.read_excel(xl, sheet_name='Статистика по странам')
+        for _, row in df.iterrows():
+            context['country_stats'].append({
+                'country': _safe_str(row.get('Страна')),
+                'count': _safe_int(row.get('Количество отказов')),
+                'ips': []  # пустой список (set не сериализуется в JSON)
+            })
+    
+    # IP из датацентров
+    if 'IP из датацентров' in xl.sheet_names:
+        df = pd.read_excel(xl, sheet_name='IP из датацентров')
+        for _, row in df.iterrows():
+            context['datacenter_ips'].append({
+                'ip': _safe_str(row.get('IP')),
+                'country': _safe_str(row.get('Страна'), 'Unknown'),
+                'isp': _safe_str(row.get('Провайдер'), 'Unknown'),
+                'bounce_count': _safe_int(row.get('Количество отказов'))
+            })
+    
+    # Аномалии нагрузки
+    if 'Аномалии нагрузки' in xl.sheet_names:
+        df = pd.read_excel(xl, sheet_name='Аномалии нагрузки')
+        for _, row in df.iterrows():
+            err_str = _safe_str(row.get('Процент ошибок'), '0').replace('%', '').replace(',', '.')
+            try:
+                error_rate = float(err_str) if err_str else 0.0
+            except ValueError:
+                error_rate = 0.0
+            reasons_raw = row.get('Причины аномалии', '')
+            reasons = str(reasons_raw).split('; ') if pd.notna(reasons_raw) and str(reasons_raw).strip() else []
+            context['load_anomalies'].append({
+                'period_start': row.get('Начало периода'),
+                'period_end': row.get('Конец периода'),
+                'request_count': _safe_int(row.get('Количество запросов')),
+                'unique_ips': _safe_int(row.get('Уникальных IP')),
+                'error_rate': error_rate,
+                'reasons': reasons,
+                'top_ips': {},
+                'top_urls': {}
+            })
+    
+    return context
+
 
 class ExcelReporter:
     """Генератор отчетов в Excel"""
@@ -35,6 +157,19 @@ class ExcelReporter:
                     summary_data['Значение'].append(v)
             
             pd.DataFrame(summary_data).to_excel(writer, sheet_name='Сводка', index=False)
+
+            # Краткий обзор по датам
+            if bounce_analysis.get('daily_stats'):
+                daily_data = []
+                for row in bounce_analysis['daily_stats']:
+                    daily_data.append({
+                        'Дата': row['date'],
+                        'Всего запросов': row['total_requests'],
+                        'Прямых заходов': row['direct'],
+                        'Отказов': row['bounces'],
+                        'Процент отказов (%)': f"{row['bounce_rate']:.2f}%"
+                    })
+                pd.DataFrame(daily_data).to_excel(writer, sheet_name='Обзор по датам', index=False)
             
             # Подозрительные IP
             if suspicious_patterns.get('suspicious_ips'):
