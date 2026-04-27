@@ -1,5 +1,5 @@
 
-import os
+import copy
 import yaml
 from pathlib import Path
 
@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
 
 class Config:
     def __init__(self, config_path=None):
-        self.config = DEFAULT_CONFIG.copy()
+        self.config = copy.deepcopy(DEFAULT_CONFIG)
         if config_path:
             self.load(config_path)
     

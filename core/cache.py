@@ -23,14 +23,16 @@ def _norm_path(p):
     return str(Path(p).resolve())
 
 
-def get_cache_dir(log_path, cache_dir=None):
+def get_cache_dir(log_path, cache_dir=None, cache_key=None):
     """Директория кэша: cache_dir или .log_analyz_cache рядом с логами."""
     base = Path(log_path).resolve()
     if base.is_file():
         base = base.parent
     if cache_dir:
-        return Path(cache_dir).resolve()
-    return base / ".log_analyz_cache"
+        root = Path(cache_dir).resolve()
+    else:
+        root = base / ".log_analyz_cache"
+    return root / cache_key if cache_key else root
 
 
 def get_progress_path(cache_dir):

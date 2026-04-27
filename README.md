@@ -11,6 +11,7 @@
 - Генерирует отчеты:
   - Excel (`.xlsx`)
   - HTML
+  - PDF для прикрепления к задаче
   - краткий текстовый итог (`.txt`)
 - Делает AI-анализ (GigaChat) по готовому Excel-отчету.
 
@@ -49,6 +50,7 @@
 ```bash
 ./venv/bin/python3 main.py logs/ --format excel
 ./venv/bin/python3 main.py logs/ --format html
+./venv/bin/python3 main.py logs/ --format pdf
 ./venv/bin/python3 main.py logs/ --format all
 ```
 
@@ -59,6 +61,7 @@
 - путь: `<папка_логов>/.log_analyz_cache/`
 - файлы: `entries.db` (SQLite), `progress.json`
 - уже обработанные файлы пропускаются при повторном запуске
+- для разных `--start-date`/`--end-date` используются отдельные подкаталоги кэша
 
 Флаги:
 
@@ -72,17 +75,41 @@
 
 - `<domain>_report_<timestamp>.xlsx`
 - `<domain>_report_<timestamp>.html` (если выбран `html`/`all`)
+- `<domain>_report_<timestamp>.pdf` (если выбран `pdf`/`all`)
 - `<domain>_summary_<timestamp>.txt` (краткий итог)
 
 ### Что есть в Excel
 
 - `Сводка`
+- `Заключение` — человекочитаемый вывод для проверки direct/bounce
+- `Вклад в bounce` — оценка доли подозрительных отказов и bounce rate после их исключения
+- `Сравнение периодов` — весь период, база до последних 7 дней, последние 7 дней
+- `Рекомендации IP` и `Рекомендации UA` — block/monitor/allow с причинами
+- `Категории атак` — типы сканирования (`.env`, `wp-config`, webshell, credentials и т.д.)
+- `Готовые правила` — примеры nginx/iptables/rate limit
+- `Не блокировать` — allowlist-пояснения для поисковых ботов, prefetch и внутренних IP
+- `Матрица угроз` — SOC/MITRE-подобное разложение по стадиям атаки
+- `Возможные успехи` — чувствительные URL, вернувшие 2xx/3xx
+- `Payload findings` — признаки SQLi/XSS/LFI/path traversal/command injection
+- `Kill chain IP` — последовательность стадий по IP
+- `Кампании` — волны активности по часам
 - `Обзор по датам` — дневной срез:
   - всего запросов
   - прямых заходов
   - отказов
   - процент отказов
+- сессии считаются с тайм-аутом 30 минут для одного IP + User-Agent
 - листы по suspicious IP/UA, ошибкам, нагрузке и аномалиям
+
+Дополнительно создаётся папка `<domain>_iocs_<timestamp>/`:
+
+- `blocklist_ips.txt`
+- `monitor_ips.txt`
+- `suspicious_user_agents.txt`
+- `suspicious_paths.txt`
+- `nginx_security_rules.conf`
+- `iptables_drop.sh`
+- `ioc_summary.md`
 
 ## AI анализ
 

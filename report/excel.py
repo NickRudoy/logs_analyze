@@ -130,7 +130,7 @@ class ExcelReporter:
     def __init__(self, output_path):
         self.output_path = output_path
         
-    def generate(self, bounce_analysis, suspicious_patterns, load_analysis=None, summary_extra=None):
+    def generate(self, bounce_analysis, suspicious_patterns, load_analysis=None, summary_extra=None, investigation=None):
         """Генерирует Excel отчет"""
         print(f"\nГенерация отчета: {self.output_path}")
         
@@ -142,12 +142,16 @@ class ExcelReporter:
                     'Отказов',
                     'Не отказов',
                     'Процент отказов (%)',
+                    'Прямых сессий',
+                    'Сессий с отказом',
                 ],
                 'Значение': [
                     bounce_analysis['total_direct'],
                     bounce_analysis['bounces'],
                     bounce_analysis['non_bounces'],
                     f"{bounce_analysis['bounce_rate']:.2f}%",
+                    bounce_analysis.get('direct_sessions', 0),
+                    bounce_analysis.get('bounce_sessions', 0),
                 ]
             }
             
@@ -157,6 +161,191 @@ class ExcelReporter:
                     summary_data['Значение'].append(v)
             
             pd.DataFrame(summary_data).to_excel(writer, sheet_name='Сводка', index=False)
+
+            if investigation:
+                pd.DataFrame([{
+                    'Заключение': investigation.get('conclusion', ''),
+                }]).to_excel(writer, sheet_name='Заключение', index=False)
+
+                contrib = investigation.get('bounce_contribution', {})
+                contribution_data = [
+                    {'Метрика': 'Прямых заходов', 'Значение': contrib.get('total_direct', 0)},
+                    {'Метрика': 'Отказов direct', 'Значение': contrib.get('total_bounces', 0)},
+                    {'Метрика': 'Исходный Bounce Rate (%)', 'Значение': f"{contrib.get('raw_bounce_rate', 0):.2f}%"},
+                    {'Метрика': 'Подозрительных отказов', 'Значение': contrib.get('suspicious_bounces', 0)},
+                    {'Метрика': 'Доля подозрительных отказов (%)', 'Значение': f"{contrib.get('suspicious_bounce_share', 0):.2f}%"},
+                    {'Метрика': 'Отказов после исключения подозрительных', 'Значение': contrib.get('cleaned_bounces', 0)},
+                    {'Метрика': 'Bounce Rate после исключения (%)', 'Значение': f"{contrib.get('cleaned_bounce_rate', 0):.2f}%"},
+                ]
+                pd.DataFrame(contribution_data).to_excel(writer, sheet_name='Вклад в bounce', index=False)
+
+                if investigation.get('period_comparison'):
+                    period_rows = []
+                    for row in investigation['period_comparison']:
+                        period_rows.append({
+                            'Период': row['period'],
+                            'Начало': row['start'],
+                            'Конец': row['end'],
+                            'Всего запросов': row['total_requests'],
+                            'Direct': row['direct'],
+                            'Отказы': row['bounces'],
+                            'Bounce Rate (%)': f"{row['bounce_rate']:.2f}%"
+                        })
+                    pd.DataFrame(period_rows).to_excel(writer, sheet_name='Сравнение периодов', index=False)
+
+                if investigation.get('recommendations'):
+                    rec_rows = []
+                    for row in investigation['recommendations']:
+                        rec_rows.append({
+                            'IP': row['ip'],
+                            'Действие': row['action'],
+                            'Критичность': row['severity'],
+                            'Отказов': row['bounce_count'],
+                            'Score': row['score'],
+                            'Страна': row['country'],
+                            'Провайдер': row['isp'],
+                            'Датацентр': 'Да' if row['is_datacenter'] else 'Нет',
+                            'Категории атак': row['attack_categories'],
+                            'Причина': row['reason'],
+                            'Примеры URL': row['sample_urls'],
+                        })
+                    pd.DataFrame(rec_rows).to_excel(writer, sheet_name='Рекомендации IP', index=False)
+
+                if investigation.get('ua_recommendations'):
+                    ua_rec_rows = []
+                    for row in investigation['ua_recommendations']:
+                        ua_rec_rows.append({
+                            'User-Agent': row['user_agent'],
+                            'Действие': row['action'],
+                            'Отказов': row['bounce_count'],
+                            'Уникальных IP': row['unique_ips'],
+                            'Категории атак': row['attack_categories'],
+                            'Примеры IP': row['sample_ips'],
+                            'Примеры URL': row['sample_urls'],
+                        })
+                    pd.DataFrame(ua_rec_rows).to_excel(writer, sheet_name='Рекомендации UA', index=False)
+
+                if investigation.get('attack_categories'):
+                    pd.DataFrame([
+                        {'Категория': row['category'], 'Количество': row['count']}
+                        for row in investigation['attack_categories']
+                    ]).to_excel(writer, sheet_name='Категории атак', index=False)
+
+                if investigation.get('rules'):
+                    pd.DataFrame([
+                        {
+                            'Тип': row['type'],
+                            'Описание': row['description'],
+                            'Правило': row['rule'],
+                        }
+                        for row in investigation['rules']
+                    ]).to_excel(writer, sheet_name='Готовые правила', index=False)
+
+                if investigation.get('allowlist_notes'):
+                    pd.DataFrame([
+                        {
+                            'Объект': row['item'],
+                            'Действие': row['action'],
+                            'Комментарий': row['note'],
+                        }
+                        for row in investigation['allowlist_notes']
+                    ]).to_excel(writer, sheet_name='Не блокировать', index=False)
+
+                security = investigation.get('security', {})
+                if security.get('successful_sensitive'):
+                    pd.DataFrame([
+                        {
+                            'Время': row['time'].strftime('%Y-%m-%d %H:%M:%S'),
+                            'IP': row['ip'],
+                            'Статус': row['status'],
+                            'Метод': row['method'],
+                            'URL': row['url'],
+                            'Категория': row['category'],
+                            'Риск': row['risk'],
+                            'Интерпретация': row.get('interpretation', ''),
+                            'User-Agent': row['user_agent'],
+                            'Комментарий': row['note'],
+                        }
+                        for row in security['successful_sensitive']
+                    ]).to_excel(writer, sheet_name='Возможные успехи', index=False)
+
+                if security.get('payload_findings'):
+                    pd.DataFrame([
+                        {
+                            'Время': row['time'].strftime('%Y-%m-%d %H:%M:%S'),
+                            'IP': row['ip'],
+                            'Статус': row['status'],
+                            'Метод': row['method'],
+                            'URL': row['url'],
+                            'Payload': row['payload_types'],
+                            'Риск': row['risk'],
+                            'User-Agent': row['user_agent'],
+                        }
+                        for row in security['payload_findings']
+                    ]).to_excel(writer, sheet_name='Payload findings', index=False)
+
+                if security.get('kill_chain'):
+                    pd.DataFrame([
+                        {
+                            'IP': row['ip'],
+                            'Действие': row['action'],
+                            'Критичность': row['severity'],
+                            'Стадии': row['stages'],
+                            'Число стадий': row['stage_count'],
+                            'Событий': row['total_events'],
+                        }
+                        for row in security['kill_chain']
+                    ]).to_excel(writer, sheet_name='Kill chain IP', index=False)
+
+                if security.get('campaigns'):
+                    pd.DataFrame([
+                        {
+                            'Начало часа': row['period_start'].strftime('%Y-%m-%d %H:%M:%S'),
+                            'Запросов': row['request_count'],
+                            'Уникальных IP': row['unique_ips'],
+                            'Топ IP': row['top_ips'],
+                            'Категории': row['top_categories'],
+                            'Payload': row['payloads'],
+                            'Примеры URL': row['sample_urls'],
+                        }
+                        for row in security['campaigns']
+                    ]).to_excel(writer, sheet_name='Кампании', index=False)
+
+                if security.get('mitre_matrix'):
+                    pd.DataFrame([
+                        {
+                            'Стадия': row['stage'],
+                            'MITRE tactic': row['mitre_tactic'],
+                            'Technique': row['technique'],
+                            'Событий': row['events'],
+                            'Доказательства': row['evidence'],
+                            'Риск': row['risk'],
+                        }
+                        for row in security['mitre_matrix']
+                    ]).to_excel(writer, sheet_name='Матрица угроз', index=False)
+
+                if security.get('sensitive_summary'):
+                    pd.DataFrame([
+                        {'Категория': row['category'], 'Количество': row['count']}
+                        for row in security['sensitive_summary']
+                    ]).to_excel(writer, sheet_name='Sensitive summary', index=False)
+
+                if security.get('payload_summary'):
+                    pd.DataFrame([
+                        {'Payload': row['payload_type'], 'Количество': row['count']}
+                        for row in security['payload_summary']
+                    ]).to_excel(writer, sheet_name='Payload summary', index=False)
+
+                if security.get('manual_checklist'):
+                    pd.DataFrame([
+                        {
+                            'Приоритет': row['priority'],
+                            'Проверка': row['check'],
+                            'Зачем': row['why'],
+                            'Как проверить': row['how'],
+                        }
+                        for row in security['manual_checklist']
+                    ]).to_excel(writer, sheet_name='Чеклист проверки', index=False)
 
             # Краткий обзор по датам
             if bounce_analysis.get('daily_stats'):
@@ -189,6 +378,7 @@ class ExcelReporter:
                         'User-Agent': '; '.join(item['user_agents'][:3])[:200],
                         'Оценка подозрительности': item['score'],
                         'Причины': '; '.join(item['reasons']),
+                        'Категории атак': '; '.join(item.get('attack_categories', {}).keys()),
                         'Первый визит': item['first_seen'].strftime('%Y-%m-%d %H:%M:%S'),
                         'Последний визит': item['last_seen'].strftime('%Y-%m-%d %H:%M:%S'),
                         'Примеры URL': '; '.join(item['sample_urls'][:5])[:500]
@@ -211,7 +401,8 @@ class ExcelReporter:
                         'Количество отказов': item['bounce_count'],
                         'Уникальных IP': item['unique_ips'],
                         'Примеры IP': '; '.join(item['sample_ips'][:5]),
-                        'Примеры URL': '; '.join(item['sample_urls'][:5])[:500]
+                        'Примеры URL': '; '.join(item['sample_urls'][:5])[:500],
+                        'Категории атак': '; '.join(item.get('attack_categories', {}).keys())
                     })
                 pd.DataFrame(ua_data).to_excel(writer, sheet_name='Подозрительные User-Agent', index=False)
             

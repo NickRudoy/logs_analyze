@@ -1,11 +1,12 @@
 
 import gzip
+import hashlib
 import re
 import sys
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 try:
     import numpy as np
     HAS_NUMPY = True
@@ -38,6 +39,17 @@ class DirectTrafficAnalyzer:
         self.bounce_session_keys = set()
         self.geo_analyzer = GeoIPAnalyzer(use_api=use_geoip, verbose=verbose) if use_geoip else None
         self.ua_analyzer = UserAgentAnalyzer()
+
+    def _cache_key(self):
+        """Разделяет кэш по параметрам, влияющим на состав распарсенных записей."""
+        parts = [
+            f"start={self.start_date.isoformat() if self.start_date else ''}",
+            f"end={self.end_date.isoformat() if self.end_date else ''}",
+        ]
+        if not any(part.split("=", 1)[1] for part in parts):
+            return None
+        digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+        return f"parsed_{digest}"
     
     def _resolve_log_files(self, log_path):
         """Определяет список файлов для анализа"""
@@ -52,7 +64,12 @@ class DirectTrafficAnalyzer:
                     or '-acc-' in name_lower
                     or name_lower.endswith('-acc')
                 )
-                return has_access and (p.suffix in {'', '.log', '.gz', '.txt'} or True)
+                suffixes = ''.join(p.suffixes).lower()
+                return has_access and (
+                    p.suffix in {'', '.log', '.gz', '.txt'}
+                    or suffixes.endswith(('.log.gz', '.txt.gz'))
+                    or re.search(r'\.log\.\d+(\.gz)?$', name_lower) is not None
+                )
             access_files = sorted([p for p in all_files if is_access_log(p)])
             skipped_logs = [p.name for p in all_files if ('log' in p.name.lower() or p.suffix == '.gz') and p not in access_files]
             if skipped_logs:
@@ -139,14 +156,9 @@ class DirectTrafficAnalyzer:
         return open(log_file, 'r', encoding='utf-8', errors='ignore')
 
     def _is_direct_entry(self, entry):
-        """Проверяет, является ли запись прямым заходом (с фильтром ботов/статических ресурсов)."""
+        """Проверяет прямой заход: пустой referer плюс фильтр ботов/статики."""
         referer = entry.get('referer', '')
-        is_direct = (
-            referer == '-'
-            or referer == ''
-            or self.domain not in referer.lower()
-        )
-        if not is_direct:
+        if referer not in ('', '-'):
             return False
 
         user_agent = entry.get('user_agent', '').lower()
@@ -166,7 +178,7 @@ class DirectTrafficAnalyzer:
 
     def _load_entries_from_cache(self):
         """Загружает записи из SQLite-кэша в self.entries (батчами, с учётом max_entries)."""
-        cache_dir = cache_mod.get_cache_dir(self.log_path, self.cache_dir)
+        cache_dir = cache_mod.get_cache_dir(self.log_path, self.cache_dir, self._cache_key())
         db_path = cache_mod.get_db_path(cache_dir)
         total = cache_mod.count_entries(db_path)
         if total == 0:
@@ -208,7 +220,8 @@ class DirectTrafficAnalyzer:
             print(f"Лимит записей: {self.max_entries:,} (для экономии памяти)")
         
         use_cache = self.use_cache and (self.log_path.is_dir() or self.log_path.is_file())
-        cache_dir = cache_mod.get_cache_dir(self.log_path, self.cache_dir) if use_cache else None
+        cache_key = self._cache_key()
+        cache_dir = cache_mod.get_cache_dir(self.log_path, self.cache_dir, cache_key) if use_cache else None
         db_path = cache_mod.get_db_path(cache_dir) if use_cache else None
         log_dir_abs = cache_mod._norm_path(self.log_path if self.log_path.is_dir() else self.log_path.parent)
         if use_cache:
@@ -314,7 +327,7 @@ class DirectTrafficAnalyzer:
     def analyze_bounce_rate(self):
         """Анализирует отказы (bounce rate)"""
         print("\nАнализ отказов...")
-        sessions = defaultdict(lambda: {'total': 0, 'ok200': 0})
+        sessions = defaultdict(lambda: {'entries': []})
         daily_stats = defaultdict(lambda: {'total_requests': 0, 'direct': 0, 'bounces': 0})
         for entry in self.entries:
             day = entry['timestamp'].date().isoformat()
@@ -322,26 +335,48 @@ class DirectTrafficAnalyzer:
             if not self._is_direct_entry(entry):
                 continue
             key = f"{entry['ip']}|{entry['user_agent']}"
-            sessions[key]['total'] += 1
-            if entry['status'] == 200:
-                sessions[key]['ok200'] += 1
+            sessions[key]['entries'].append(entry)
             daily_stats[day]['direct'] += 1
 
-        bounce_session_keys = {k for k, v in sessions.items() if v['ok200'] <= 1}
+        session_timeout = timedelta(minutes=30)
+        session_entries = {}
+        for base_key, data in sessions.items():
+            current_session = []
+            session_index = 0
+            previous_ts = None
+            for entry in sorted(data['entries'], key=lambda e: e['timestamp']):
+                if previous_ts is not None and entry['timestamp'] - previous_ts > session_timeout:
+                    if current_session:
+                        session_entries[f"{base_key}|{session_index}"] = current_session
+                    session_index += 1
+                    current_session = []
+                current_session.append(entry)
+                previous_ts = entry['timestamp']
+            if current_session:
+                session_entries[f"{base_key}|{session_index}"] = current_session
+
+        bounce_session_keys = {
+            k for k, entries in session_entries.items()
+            if sum(1 for entry in entries if entry['status'] == 200) <= 1
+        }
         self.bounce_session_keys = bounce_session_keys
 
         bounce_count = 0
         bounce_samples = []
-        for entry in self.entries:
-            if not self._is_direct_entry(entry):
-                continue
-            key = f"{entry['ip']}|{entry['user_agent']}"
-            if key in bounce_session_keys:
-                bounce_count += 1
+        for key in bounce_session_keys:
+            entries = session_entries[key]
+            bounce_count += len(entries)
+            for entry in entries:
                 day = entry['timestamp'].date().isoformat()
                 daily_stats[day]['bounces'] += 1
                 if len(bounce_samples) < 1000:
                     bounce_samples.append(entry)
+
+        bounce_entry_keys = {
+            self._entry_identity(entry)
+            for key in bounce_session_keys
+            for entry in session_entries[key]
+        }
 
         total_direct = self.direct_traffic_count
         non_bounces = max(0, total_direct - bounce_count)
@@ -370,12 +405,25 @@ class DirectTrafficAnalyzer:
             'bounce_entries': bounce_samples,
             'daily_stats': daily_rows,
             'bounce_session_keys': bounce_session_keys,
+            'bounce_entry_keys': bounce_entry_keys,
+            'direct_sessions': len(session_entries),
+            'bounce_sessions': len(bounce_session_keys),
         }
+
+    def _entry_identity(self, entry):
+        """Компактный идентификатор записи для внутренних пересечений выборок."""
+        return (
+            entry.get('ip'),
+            entry.get('user_agent'),
+            entry.get('timestamp'),
+            entry.get('url'),
+            entry.get('status'),
+        )
     
     def find_suspicious_patterns(self, bounce_analysis):
         """Выявляет подозрительные паттерны"""
         print("\nПоиск подозрительных паттернов...")
-        bounce_session_keys = bounce_analysis.get('bounce_session_keys', set())
+        bounce_entry_keys = bounce_analysis.get('bounce_entry_keys', set())
         
         initial_success = 0
         initial_errors = 0
@@ -393,26 +441,29 @@ class DirectTrafficAnalyzer:
             'datacenter_ips': []
         }
 
-        if not bounce_session_keys:
+        if not bounce_entry_keys:
             return suspicious
 
         ip_counter = Counter()
         ip_unique_urls = defaultdict(set)
         ip_unique_uas = defaultdict(set)
         ip_sample_urls = defaultdict(list)
+        ip_attack_categories = defaultdict(Counter)
         ip_first_seen = {}
         ip_last_seen = {}
         ua_counter = Counter()
         ua_unique_ips = defaultdict(set)
         ua_sample_urls = defaultdict(set)
+        ua_attack_categories = defaultdict(Counter)
         ip_timestamps = defaultdict(list)
         error_counter = Counter()
+        attack_category_counter = Counter()
 
         for entry in self.entries:
             if not self._is_direct_entry(entry):
                 continue
-            key = f"{entry['ip']}|{entry['user_agent']}"
-            if key not in bounce_session_keys:
+            key = self._entry_identity(entry)
+            if key not in bounce_entry_keys:
                 continue
 
             ip = entry['ip']
@@ -426,6 +477,10 @@ class DirectTrafficAnalyzer:
             ip_unique_uas[ip].add(ua)
             if len(ip_sample_urls[ip]) < 200:
                 ip_sample_urls[ip].append(url)
+            attack_category = self._classify_attack_category(url)
+            ip_attack_categories[ip][attack_category] += 1
+            ua_attack_categories[ua][attack_category] += 1
+            attack_category_counter[attack_category] += 1
             if ip not in ip_first_seen or ts < ip_first_seen[ip]:
                 ip_first_seen[ip] = ts
             if ip not in ip_last_seen or ts > ip_last_seen[ip]:
@@ -487,6 +542,7 @@ class DirectTrafficAnalyzer:
                     'unique_user_agents': unique_user_agents,
                     'user_agents': list(ip_unique_uas[ip])[:10],
                     'sample_urls': urls[:10],
+                    'attack_categories': dict(ip_attack_categories[ip].most_common(5)),
                     'score': suspicious_score,
                     'reasons': reasons,
                     'first_seen': ip_first_seen.get(ip, datetime.now()),
@@ -512,6 +568,7 @@ class DirectTrafficAnalyzer:
                         'unique_ips': unique_ips,
                         'sample_ips': list(ua_unique_ips[ua])[:10],
                         'sample_urls': list(ua_sample_urls[ua])[:10],
+                        'attack_categories': dict(ua_attack_categories[ua].most_common(5)),
                         'browser': ua_info['browser'],
                         'browser_version': ua_info['browser_version'],
                         'os': ua_info['os'],
@@ -545,6 +602,11 @@ class DirectTrafficAnalyzer:
                     'status': status,
                     'count': count
                 })
+
+        suspicious['attack_categories'] = [
+            {'category': category, 'count': count}
+            for category, count in attack_category_counter.most_common()
+        ]
         
         if self.use_geoip and self.geo_analyzer:
             success_count = self.geo_analyzer.success_count - initial_success
@@ -555,6 +617,575 @@ class DirectTrafficAnalyzer:
                 print(f"Геолокация: успешно {success_count}/{total_requests} ({success_rate:.1f}%), ошибок: {error_count}")
         
         return suspicious
+
+    def _classify_attack_category(self, url):
+        """Классифицирует URL по типовым признакам нежелательной активности."""
+        path = urlparse(url).path.lower()
+        raw = url.lower()
+        checks = [
+            ('env/config scan', ['.env', 'config.php', 'configuration.php', 'database.yml', 'settings.php', '.pypirc']),
+            ('credential scan', ['.aws/credentials', 'id_rsa', '.ssh', 'credentials', 'password', 'passwd']),
+            ('wordpress scan', ['wp-login', 'wp-admin', 'wp-config', 'xmlrpc.php', 'wp-content', 'wp-includes']),
+            ('php shell scan', ['shell.php', 'ws80.php', 'wso.php', 'fm.php', 'sf.php', 'alfa.php', 'c99.php', 'r57.php']),
+            ('admin/login scan', ['/admin', '/login', '/manager', '/bitrix/admin', '/phpmyadmin']),
+            ('tech file scan', ['.git', '.svn', '.hg', '.dockerenv', 'phpinfo', 'phpversion', 'server-status']),
+            ('encoded/probing URL', ['%2e', '%61', '%63', '::$data']),
+        ]
+        for category, needles in checks:
+            if any(needle in path or needle in raw for needle in needles):
+                return category
+        if path.endswith('.php') and path not in {'/index.php'}:
+            return 'generic php probe'
+        return 'generic probing'
+
+    def build_investigation_report(self, bounce_analysis, suspicious_patterns, load_analysis=None):
+        """Готовит человекочитаемое заключение и практические рекомендации."""
+        total_direct = bounce_analysis.get('total_direct', 0)
+        total_bounces = bounce_analysis.get('bounces', 0)
+        suspicious_ips = sorted(
+            suspicious_patterns.get('suspicious_ips', []),
+            key=lambda x: (x.get('score', 0), x.get('bounce_count', 0)),
+            reverse=True
+        )
+        datacenter_ips = {x.get('ip') for x in suspicious_patterns.get('datacenter_ips', [])}
+        datacenter_count = len(datacenter_ips) if self.use_geoip else None
+
+        recommendations = []
+        block_ips = []
+        monitor_ips = []
+        for item in suspicious_ips:
+            action = self._recommend_ip_action(item, datacenter_ips)
+            row = {
+                'ip': item['ip'],
+                'action': action,
+                'severity': self._severity_for_ip(item, action),
+                'bounce_count': item.get('bounce_count', 0),
+                'score': item.get('score', 0),
+                'country': item.get('country', 'Unknown'),
+                'isp': item.get('isp', 'Unknown'),
+                'is_datacenter': item.get('is_datacenter', False) or item['ip'] in datacenter_ips,
+                'attack_categories': '; '.join(item.get('attack_categories', {}).keys()),
+                'reason': '; '.join(item.get('reasons', [])),
+                'sample_urls': '; '.join(item.get('sample_urls', [])[:5]),
+            }
+            recommendations.append(row)
+            if action == 'block':
+                block_ips.append(item['ip'])
+            elif action == 'monitor':
+                monitor_ips.append(item['ip'])
+
+        suspicious_bounces = sum(x.get('bounce_count', 0) for x in suspicious_ips)
+        suspicious_bounces = min(suspicious_bounces, total_bounces)
+        cleaned_bounces = max(0, total_bounces - suspicious_bounces)
+        cleaned_bounce_rate = (cleaned_bounces / total_direct * 100) if total_direct else 0
+        contribution_pct = (suspicious_bounces / total_bounces * 100) if total_bounces else 0
+
+        ua_recommendations = self._build_ua_recommendations(suspicious_patterns.get('suspicious_user_agents', []))
+        attack_categories = suspicious_patterns.get('attack_categories', [])
+        period_comparison = self._build_period_comparison(bounce_analysis.get('daily_stats', []))
+        rules = self._build_security_rules(block_ips, ua_recommendations)
+        allowlist_notes = self._build_allowlist_notes(suspicious_patterns)
+        security = self.build_security_report(recommendations, suspicious_patterns)
+
+        conclusion = self._build_conclusion(
+            total_direct=total_direct,
+            total_bounces=total_bounces,
+            suspicious_bounces=suspicious_bounces,
+            contribution_pct=contribution_pct,
+            block_count=len(block_ips),
+            datacenter_count=datacenter_count,
+            attack_categories=attack_categories,
+            load_analysis=load_analysis,
+        )
+
+        return {
+            'conclusion': conclusion,
+            'period_comparison': period_comparison,
+            'bounce_contribution': {
+                'total_direct': total_direct,
+                'total_bounces': total_bounces,
+                'raw_bounce_rate': bounce_analysis.get('bounce_rate', 0),
+                'suspicious_bounces': suspicious_bounces,
+                'suspicious_bounce_share': contribution_pct,
+                'cleaned_bounces': cleaned_bounces,
+                'cleaned_bounce_rate': cleaned_bounce_rate,
+            },
+            'recommendations': recommendations,
+            'ua_recommendations': ua_recommendations,
+            'attack_categories': attack_categories,
+            'rules': rules,
+            'allowlist_notes': allowlist_notes,
+            'security': security,
+            'block_ips': block_ips,
+            'monitor_ips': monitor_ips,
+            'geoip_enabled': self.use_geoip,
+        }
+
+    def build_security_report(self, recommendations, suspicious_patterns):
+        """Расширенный SOC/forensics-срез по access-логам."""
+        suspicious_ip_actions = {row['ip']: row['action'] for row in recommendations}
+        high_risk_ips = {ip for ip, action in suspicious_ip_actions.items() if action in {'block', 'monitor'}}
+        successful_sensitive = []
+        payload_findings = []
+        sensitive_counter = Counter()
+        payload_counter = Counter()
+        ip_stage_counter = defaultdict(Counter)
+        hourly_campaigns = defaultdict(lambda: {
+            'request_count': 0,
+            'ips': Counter(),
+            'categories': Counter(),
+            'payloads': Counter(),
+            'sample_urls': []
+        })
+
+        for entry in self.entries:
+            ip = entry.get('ip')
+            url = entry.get('url', '')
+            status = int(entry.get('status', 0) or 0)
+            category = self._classify_attack_category(url)
+            stage = self._security_stage_for_category(category)
+            payloads = self._detect_payload_patterns(url)
+            is_sensitive = category in {
+                'env/config scan', 'credential scan', 'wordpress scan',
+                'php shell scan', 'admin/login scan', 'tech file scan'
+            }
+
+            if is_sensitive:
+                sensitive_counter[category] += 1
+            if payloads:
+                for payload in payloads:
+                    payload_counter[payload] += 1
+
+            if ip in high_risk_ips or is_sensitive or payloads:
+                ip_stage_counter[ip][stage] += 1
+                hour = entry['timestamp'].replace(minute=0, second=0, microsecond=0)
+                campaign = hourly_campaigns[hour]
+                campaign['request_count'] += 1
+                campaign['ips'][ip] += 1
+                campaign['categories'][category] += 1
+                for payload in payloads:
+                    campaign['payloads'][payload] += 1
+                if len(campaign['sample_urls']) < 10:
+                    campaign['sample_urls'].append(url)
+
+            if is_sensitive and 200 <= status < 400 and len(successful_sensitive) < 500:
+                successful_sensitive.append({
+                    'time': entry['timestamp'],
+                    'ip': ip,
+                    'status': status,
+                    'url': url,
+                    'category': category,
+                    'method': entry.get('method', '-'),
+                    'user_agent': entry.get('user_agent', '')[:200],
+                    'risk': self._risk_for_successful_sensitive(category, status),
+                    'interpretation': self._interpret_sensitive_status(status, category),
+                    'note': 'Проверить конечный ответ, Location для редиректа, размер ответа и наличие реального файла/эндпоинта.',
+                })
+
+            if payloads and len(payload_findings) < 500:
+                payload_findings.append({
+                    'time': entry['timestamp'],
+                    'ip': ip,
+                    'status': status,
+                    'url': url,
+                    'payload_types': '; '.join(payloads),
+                    'method': entry.get('method', '-'),
+                    'user_agent': entry.get('user_agent', '')[:200],
+                    'risk': 'high' if status < 500 else 'medium',
+                })
+
+        kill_chain = self._build_kill_chain(ip_stage_counter, recommendations)
+        campaigns = self._build_campaign_rows(hourly_campaigns)
+        mitre_matrix = self._build_mitre_matrix(suspicious_patterns, payload_counter)
+        iocs = self._build_iocs(recommendations, suspicious_patterns, payload_findings, successful_sensitive)
+        manual_checklist = self._build_manual_checklist(successful_sensitive, payload_findings, suspicious_patterns)
+
+        return {
+            'successful_sensitive': successful_sensitive,
+            'payload_findings': payload_findings,
+            'kill_chain': kill_chain,
+            'campaigns': campaigns,
+            'mitre_matrix': mitre_matrix,
+            'sensitive_summary': [
+                {'category': category, 'count': count}
+                for category, count in sensitive_counter.most_common()
+            ],
+            'payload_summary': [
+                {'payload_type': payload, 'count': count}
+                for payload, count in payload_counter.most_common()
+            ],
+            'manual_checklist': manual_checklist,
+            'iocs': iocs,
+        }
+
+    def _security_stage_for_category(self, category):
+        mapping = {
+            'env/config scan': 'Credential Access',
+            'credential scan': 'Credential Access',
+            'wordpress scan': 'Initial Access',
+            'php shell scan': 'Execution / Webshell Discovery',
+            'admin/login scan': 'Initial Access',
+            'tech file scan': 'Discovery',
+            'encoded/probing URL': 'Defense Evasion / Discovery',
+            'generic php probe': 'Reconnaissance',
+            'generic probing': 'Reconnaissance',
+        }
+        return mapping.get(category, 'Reconnaissance')
+
+    def _mitre_for_stage(self, stage):
+        mapping = {
+            'Reconnaissance': ('TA0043', 'Active Scanning / Web Service Discovery'),
+            'Credential Access': ('TA0006', 'Credentials from Files / Cloud Credentials'),
+            'Initial Access': ('TA0001', 'Exploit Public-Facing Application / Valid Accounts'),
+            'Execution / Webshell Discovery': ('TA0002', 'Web Shell / Command and Scripting Interpreter'),
+            'Discovery': ('TA0007', 'File and Directory Discovery'),
+            'Defense Evasion / Discovery': ('TA0005/TA0007', 'Obfuscated Files or Information / Discovery'),
+        }
+        return mapping.get(stage, ('TA0043', 'Active Scanning'))
+
+    def _detect_payload_patterns(self, url):
+        raw = url.lower()
+        decoded = unquote(raw)
+        haystack = f"{raw} {decoded}"
+        checks = [
+            ('SQL injection', ['union select', "' or 1=1", '" or "1"="1', 'information_schema', 'sleep(', 'benchmark(']),
+            ('XSS', ['<script', '%3cscript', 'javascript:', 'onerror=', 'onload=']),
+            ('Path traversal', ['../', '..%2f', '%2e%2e', '/etc/passwd', 'boot.ini']),
+            ('Command injection', [';cat ', '|cat ', 'wget http', 'curl http', 'bash -c', 'cmd.exe', '/bin/sh']),
+            ('LFI/RFI', ['?file=', '&file=', '?page=http', '&page=http', 'php://', 'expect://', 'data://']),
+            ('Scanner signature', ['sqlmap', 'acunetix', 'nikto', 'nuclei', 'wpscan', 'nessus']),
+        ]
+        found = []
+        for name, needles in checks:
+            if any(needle in haystack for needle in needles):
+                found.append(name)
+        return found
+
+    def _risk_for_successful_sensitive(self, category, status):
+        if category in {'credential scan', 'env/config scan'} and status == 200:
+            return 'critical'
+        if category in {'php shell scan', 'tech file scan'} and status == 200:
+            return 'high'
+        if status in {301, 302, 307, 308}:
+            return 'medium'
+        return 'medium'
+
+    def _interpret_sensitive_status(self, status, category):
+        if status == 200:
+            if category in {'credential scan', 'env/config scan'}:
+                return 'Критично: чувствительный путь отдал 200. Срочно проверить, не раскрыт ли файл/секрет.'
+            return 'Высокий риск: эндпоинт существует или отдал контент. Проверить содержимое ответа.'
+        if status in {301, 302, 307, 308}:
+            return 'Редирект: проверить Location и конечный статус. Часто это HTTPS/slash redirect, но endpoint может существовать.'
+        if status == 403:
+            return 'Защита сработала: доступ запрещён. Оставить правило и мониторить повторения.'
+        if status == 404:
+            return 'Путь не найден: признак сканирования, но успешного доступа не видно.'
+        if 500 <= status < 600:
+            return 'Ошибка сервера: проверить error.log, возможна попытка эксплуатации или нагрузочный эффект.'
+        return 'Требует ручной проверки по access/error логам.'
+
+    def _build_kill_chain(self, ip_stage_counter, recommendations):
+        rec_by_ip = {row['ip']: row for row in recommendations}
+        rows = []
+        for ip, stages in ip_stage_counter.items():
+            if ip not in rec_by_ip and sum(stages.values()) < 5:
+                continue
+            ordered = [f"{stage} ({count})" for stage, count in stages.most_common()]
+            rec = rec_by_ip.get(ip, {})
+            rows.append({
+                'ip': ip,
+                'action': rec.get('action', 'monitor'),
+                'severity': rec.get('severity', 'medium'),
+                'stages': ' -> '.join(ordered),
+                'stage_count': len(stages),
+                'total_events': sum(stages.values()),
+            })
+        return sorted(rows, key=lambda x: (x['severity'] == 'critical', x['total_events']), reverse=True)[:200]
+
+    def _build_campaign_rows(self, hourly_campaigns):
+        rows = []
+        for hour, data in hourly_campaigns.items():
+            if data['request_count'] < 20 and len(data['ips']) < 3:
+                continue
+            rows.append({
+                'period_start': hour,
+                'request_count': data['request_count'],
+                'unique_ips': len(data['ips']),
+                'top_ips': ', '.join(f"{ip}({count})" for ip, count in data['ips'].most_common(5)),
+                'top_categories': ', '.join(f"{cat}({count})" for cat, count in data['categories'].most_common(5)),
+                'payloads': ', '.join(f"{name}({count})" for name, count in data['payloads'].most_common(5)),
+                'sample_urls': '; '.join(data['sample_urls'][:5])[:500],
+            })
+        return sorted(rows, key=lambda x: x['request_count'], reverse=True)[:200]
+
+    def _build_mitre_matrix(self, suspicious_patterns, payload_counter):
+        stage_counter = Counter()
+        evidence = defaultdict(list)
+        for item in suspicious_patterns.get('attack_categories', []):
+            category = item['category']
+            stage = self._security_stage_for_category(category)
+            stage_counter[stage] += item['count']
+            if len(evidence[stage]) < 5:
+                evidence[stage].append(category)
+        for payload, count in payload_counter.items():
+            stage = 'Exploitation Attempt'
+            stage_counter[stage] += count
+            if len(evidence[stage]) < 5:
+                evidence[stage].append(payload)
+        rows = []
+        for stage, count in stage_counter.most_common():
+            tactic_id, technique = self._mitre_for_stage(stage)
+            rows.append({
+                'stage': stage,
+                'mitre_tactic': tactic_id,
+                'technique': technique,
+                'events': count,
+                'evidence': '; '.join(evidence[stage]),
+                'risk': 'critical' if stage in {'Credential Access', 'Exploitation Attempt'} else 'high',
+            })
+        return rows
+
+    def _build_iocs(self, recommendations, suspicious_patterns, payload_findings, successful_sensitive):
+        block_ips = [row['ip'] for row in recommendations if row.get('action') == 'block']
+        monitor_ips = [row['ip'] for row in recommendations if row.get('action') == 'monitor']
+        user_agents = [
+            row.get('user_agent', '')
+            for row in self._build_ua_recommendations(suspicious_patterns.get('suspicious_user_agents', []))
+            if row.get('action') == 'block' and row.get('user_agent') not in ('', '-')
+        ]
+        paths = set()
+        for item in suspicious_patterns.get('suspicious_ips', []):
+            for url in item.get('sample_urls', [])[:10]:
+                path = urlparse(url).path
+                if path:
+                    paths.add(path)
+        for row in payload_findings[:100]:
+            paths.add(urlparse(row['url']).path)
+        for row in successful_sensitive[:100]:
+            paths.add(urlparse(row['url']).path)
+        return {
+            'block_ips': block_ips,
+            'monitor_ips': monitor_ips,
+            'user_agents': sorted(set(user_agents)),
+            'paths': sorted(paths)[:500],
+        }
+
+    def _build_manual_checklist(self, successful_sensitive, payload_findings, suspicious_patterns):
+        checklist = [
+            {
+                'priority': 'critical',
+                'check': 'Проверить чувствительные URL с HTTP 200',
+                'why': '200 по .env/config/credentials/webshell-путям может означать доступный файл или endpoint.',
+                'how': 'Открыть только из доверенной сети или проверить curl -I, access.log, error.log, размер ответа и Location.',
+            },
+            {
+                'priority': 'high',
+                'check': 'Проверить все 301/302 по admin/wp/php путям',
+                'why': 'Редирект может быть обычным HTTPS/slash redirect, но также подтверждает существование маршрута.',
+                'how': 'Проверить цепочку редиректов и конечный статус; убедиться, что нет 200 на чувствительном endpoint.',
+            },
+            {
+                'priority': 'high',
+                'check': 'Сверить top IP с CDN/proxy и реальным client IP',
+                'why': 'Если сайт за прокси, 127.0.0.1 или IP балансировщика могут скрывать реального атакующего.',
+                'how': 'Проверить X-Forwarded-For/real_ip_header и настройки nginx/apache.',
+            },
+            {
+                'priority': 'medium',
+                'check': 'Проверить payload findings в error.log',
+                'why': 'Path traversal/LFI/SQLi могут не дать 200, но вызвать 400/500 или следы в приложении.',
+                'how': 'По времени и IP сопоставить access.log с error.log и application logs.',
+            },
+            {
+                'priority': 'medium',
+                'check': 'Перед блокировкой применить allowlist',
+                'why': 'Поисковые боты, prefetch proxy, мониторинг и офисные IP нельзя блокировать только по одному признаку.',
+                'how': 'Проверить reverse DNS/ASN, список клиентов, мониторинги и интеграции.',
+            },
+        ]
+        if not any(row.get('status') == 200 for row in successful_sensitive):
+            checklist[0]['priority'] = 'medium'
+            checklist[0]['why'] = 'В текущем срезе явных HTTP 200 по чувствительным путям не найдено, но правило полезно для проверки будущих отчётов.'
+        if not payload_findings:
+            checklist[3]['priority'] = 'low'
+            checklist[3]['why'] = 'Payload-паттерны в текущем срезе не найдены, но проверка полезна при расследовании.'
+        if suspicious_patterns.get('datacenter_ips'):
+            checklist.append({
+                'priority': 'medium',
+                'check': 'Проверить датацентры и облачные сети',
+                'why': 'Сканирование с облачных IP часто лучше отправлять на challenge/rate-limit, а не всегда блокировать ASN целиком.',
+                'how': 'Сгруппировать по ASN/провайдеру и оценить ложноположительные риски.',
+            })
+        return checklist
+
+    def _recommend_ip_action(self, item, datacenter_ips):
+        categories = set(item.get('attack_categories', {}).keys())
+        high_risk_category = bool(categories & {
+            'env/config scan', 'credential scan', 'php shell scan',
+            'wordpress scan', 'tech file scan', 'encoded/probing URL'
+        })
+        if item.get('score', 0) >= 4 and (item.get('bounce_count', 0) >= 50 or high_risk_category):
+            return 'block'
+        if item.get('is_datacenter') or item.get('ip') in datacenter_ips:
+            return 'block' if item.get('bounce_count', 0) >= 25 else 'monitor'
+        if item.get('score', 0) >= 2:
+            return 'monitor'
+        return 'allow'
+
+    def _severity_for_ip(self, item, action):
+        if action == 'block' and item.get('score', 0) >= 5:
+            return 'critical'
+        if action == 'block':
+            return 'high'
+        if action == 'monitor':
+            return 'medium'
+        return 'low'
+
+    def _build_ua_recommendations(self, suspicious_user_agents):
+        rows = []
+        explicit_bad = ['securityscanner', 'python-requests', 'curl', 'wget', 'scrapy', 'masscan']
+        monitor_names = ['chrome privacy preserving prefetch proxy']
+        for item in suspicious_user_agents:
+            ua = item.get('user_agent', '')
+            ua_lower = ua.lower()
+            if ua == '-' or any(token in ua_lower for token in explicit_bad):
+                action = 'block'
+            elif any(token in ua_lower for token in monitor_names):
+                action = 'allow/monitor'
+            elif item.get('bounce_count', 0) >= 100 and item.get('unique_ips', 0) >= 3:
+                action = 'monitor'
+            else:
+                action = 'monitor'
+            rows.append({
+                'user_agent': ua,
+                'action': action,
+                'bounce_count': item.get('bounce_count', 0),
+                'unique_ips': item.get('unique_ips', 0),
+                'attack_categories': '; '.join(item.get('attack_categories', {}).keys()),
+                'sample_ips': '; '.join(item.get('sample_ips', [])[:5]),
+                'sample_urls': '; '.join(item.get('sample_urls', [])[:5]),
+            })
+        return rows
+
+    def _build_period_comparison(self, daily_stats):
+        if not daily_stats:
+            return []
+        rows = []
+        sorted_rows = sorted(daily_stats, key=lambda x: x['date'])
+        periods = [('Весь период', sorted_rows)]
+        if len(sorted_rows) >= 14:
+            periods.extend([
+                ('База: до последних 7 дней', sorted_rows[:-7]),
+                ('Последние 7 дней', sorted_rows[-7:]),
+            ])
+        if len(sorted_rows) >= 2:
+            periods.extend([
+                ('Первый день', [sorted_rows[0]]),
+                ('Последний день', [sorted_rows[-1]]),
+            ])
+        for name, items in periods:
+            direct = sum(x.get('direct', 0) for x in items)
+            bounces = sum(x.get('bounces', 0) for x in items)
+            total = sum(x.get('total_requests', 0) for x in items)
+            rows.append({
+                'period': name,
+                'start': items[0]['date'],
+                'end': items[-1]['date'],
+                'total_requests': total,
+                'direct': direct,
+                'bounces': bounces,
+                'bounce_rate': (bounces / direct * 100) if direct else 0,
+            })
+        return rows
+
+    def _build_security_rules(self, block_ips, ua_recommendations):
+        block_ips = block_ips[:50]
+        block_uas = [
+            row['user_agent'] for row in ua_recommendations
+            if row.get('action') == 'block' and row.get('user_agent') not in ('', '-')
+        ][:15]
+        rules = []
+        if block_ips:
+            rules.append({
+                'type': 'nginx deny',
+                'description': 'Точечная блокировка IP с критичными признаками сканирования.',
+                'rule': '\n'.join(f"deny {ip};" for ip in block_ips[:20]),
+            })
+            rules.append({
+                'type': 'iptables',
+                'description': 'Альтернатива для сетевого уровня.',
+                'rule': '\n'.join(f"iptables -A INPUT -s {ip} -j DROP" for ip in block_ips[:20]),
+            })
+        if block_uas:
+            escaped = '|'.join(re.escape(ua[:80]) for ua in block_uas)
+            rules.append({
+                'type': 'nginx user-agent filter',
+                'description': 'Блокировка явно технических user-agent. Массовые браузерные UA лучше мониторить, а не блокировать.',
+                'rule': f'if ($http_user_agent ~* "({escaped})") {{\n    return 403;\n}}',
+            })
+        rules.append({
+            'type': 'nginx sensitive paths',
+            'description': 'Закрыть типовые пути, по которым ходят сканеры конфигов и секретов.',
+            'rule': 'location ~* "(\\.env|\\.git|\\.svn|\\.aws|wp-config|database\\.yml|phpinfo|phpversion)" {\n    deny all;\n}',
+        })
+        rules.append({
+            'type': 'nginx rate limit',
+            'description': 'Ограничить частые direct-запросы с одного IP.',
+            'rule': 'limit_req_zone $binary_remote_addr zone=direct_limit:10m rate=5r/s;\nlimit_req zone=direct_limit burst=20 nodelay;',
+        })
+        return rules
+
+    def _build_allowlist_notes(self, suspicious_patterns):
+        notes = [
+            {
+                'item': 'Поисковые боты',
+                'action': 'allow after verification',
+                'note': 'Googlebot/Bing/Yandex не блокировать только по UA; проверять reverse DNS и ASN.',
+            },
+            {
+                'item': 'Chrome Privacy Preserving Prefetch Proxy',
+                'action': 'allow/monitor',
+                'note': 'Может давать direct-like запросы и .well-known/traffic-advice; лучше не блокировать автоматически.',
+            },
+            {
+                'item': '127.0.0.1 и приватные IP',
+                'action': 'investigate locally',
+                'note': 'Разбирать отдельно: это может быть прокси, health-check, cron или особенность логирования.',
+            },
+            {
+                'item': 'IP клиента и подрядчиков',
+                'action': 'allowlist',
+                'note': 'Перед применением deny-правил исключить офисные, мониторинговые и интеграционные адреса.',
+            },
+        ]
+        if suspicious_patterns.get('datacenter_ips'):
+            notes.append({
+                'item': 'Датацентры',
+                'action': 'block or challenge',
+                'note': 'Не весь датацентр вреден, но при сканировании технических URL лучше блокировать или отправлять на антибот.',
+            })
+        return notes
+
+    def _build_conclusion(self, total_direct, total_bounces, suspicious_bounces, contribution_pct, block_count, datacenter_count, attack_categories, load_analysis):
+        top_categories = ', '.join(
+            f"{x['category']} ({x['count']})" for x in attack_categories[:3]
+        ) or 'нет выраженных категорий'
+        anomaly_count = len(load_analysis.get('anomalies', [])) if load_analysis else 0
+        dc_text = (
+            f"IP из датацентров: {datacenter_count}"
+            if datacenter_count is not None
+            else "GeoIP отключён, принадлежность к датацентрам не оценивалась"
+        )
+        return (
+            "Рост отказов по direct-трафику следует проверять как смесь реальных прямых визитов и нежелательной активности. "
+            f"В текущем срезе найдено {suspicious_bounces:,} подозрительных отказов из {total_bounces:,} "
+            f"({contribution_pct:.1f}% отказов direct). "
+            f"К блокировке рекомендовано {block_count} IP, {dc_text}, "
+            f"аномальных периодов нагрузки: {anomaly_count}. "
+            f"Основные признаки: {top_categories}. "
+            "Рекомендуется применять точечные блокировки IP, закрыть технические пути, включить rate limiting и проверять спорные UA/IP через allowlist."
+        )
     
     def _has_scanning_pattern(self, urls):
         """Определяет паттерны сканирования"""
@@ -822,6 +1453,8 @@ class DirectTrafficAnalyzer:
         print(f"Всего прямых заходов: {bounce_analysis['total_direct']}")
         print(f"Отказов: {bounce_analysis['bounces']}")
         print(f"Bounce Rate: {bounce_analysis['bounce_rate']:.2f}%")
+        print(f"Прямых сессий: {bounce_analysis.get('direct_sessions', 0)}")
+        print(f"Сессий с отказом: {bounce_analysis.get('bounce_sessions', 0)}")
         
         print("\nПОДОЗРИТЕЛЬНАЯ АКТИВНОСТЬ")
         suspicious_ips = suspicious_patterns['suspicious_ips']
@@ -845,4 +1478,3 @@ class DirectTrafficAnalyzer:
             print(f"Порог нагрузки: {load_analysis.get('threshold', 0):.0f} запросов/{load_analysis.get('window_minutes', 15)}мин")
         else:
             print("Периодов высокой нагрузки не выявлено")
-

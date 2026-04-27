@@ -8,10 +8,11 @@ from config import Config
 from core.analyzer import DirectTrafficAnalyzer
 from report.excel import ExcelReporter, load_excel_for_ai
 from report.html import HtmlReporter
+from report.pdf import PdfReporter
 from ai.gigachat import GigaChatAnalyzer
 
 
-def write_text_summary(output_path: Path, analyzer: DirectTrafficAnalyzer, bounce_analysis: dict, suspicious_patterns: dict, load_analysis: dict) -> None:
+def write_text_summary(output_path: Path, analyzer: DirectTrafficAnalyzer, bounce_analysis: dict, suspicious_patterns: dict, load_analysis: dict, investigation: dict = None) -> None:
     """Сохраняет краткий текстовый итог анализа."""
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("LOG ANALYSIS SUMMARY\n")
@@ -21,9 +22,81 @@ def write_text_summary(output_path: Path, analyzer: DirectTrafficAnalyzer, bounc
         f.write(f"Прямых заходов: {bounce_analysis['total_direct']:,}\n")
         f.write(f"Отказов: {bounce_analysis['bounces']:,}\n")
         f.write(f"Bounce Rate: {bounce_analysis['bounce_rate']:.2f}%\n")
+        f.write(f"Прямых сессий: {bounce_analysis.get('direct_sessions', 0):,}\n")
+        f.write(f"Сессий с отказом: {bounce_analysis.get('bounce_sessions', 0):,}\n")
         f.write(f"Подозрительных IP: {len(suspicious_patterns.get('suspicious_ips', []))}\n")
-        f.write(f"IP из датацентров: {len(suspicious_patterns.get('datacenter_ips', []))}\n")
+        if investigation and not investigation.get('geoip_enabled', True):
+            f.write("IP из датацентров: GeoIP отключён\n")
+        else:
+            f.write(f"IP из датацентров: {len(suspicious_patterns.get('datacenter_ips', []))}\n")
         f.write("\n")
+
+        if investigation:
+            f.write("ЗАКЛЮЧЕНИЕ ДЛЯ ПРОВЕРКИ\n")
+            f.write("-----------------------\n")
+            f.write(investigation.get('conclusion', '') + "\n\n")
+
+            contrib = investigation.get('bounce_contribution', {})
+            f.write("ВКЛАД ПОДОЗРИТЕЛЬНОГО ТРАФИКА В DIRECT BOUNCE\n")
+            f.write("---------------------------------------------\n")
+            f.write(f"Сырые отказы direct: {contrib.get('total_bounces', 0):,}\n")
+            f.write(f"Подозрительные отказы: {contrib.get('suspicious_bounces', 0):,}\n")
+            f.write(f"Доля подозрительных отказов: {contrib.get('suspicious_bounce_share', 0):.2f}%\n")
+            f.write(f"Bounce Rate после исключения подозрительных: {contrib.get('cleaned_bounce_rate', 0):.2f}%\n\n")
+
+            if investigation.get('recommendations'):
+                f.write("РЕКОМЕНДОВАНО К БЛОКИРОВКЕ / МОНИТОРИНГУ\n")
+                f.write("----------------------------------------\n")
+                for row in investigation['recommendations'][:15]:
+                    f.write(
+                        f"{row['ip']} | action={row['action']} | severity={row['severity']} | "
+                        f"bounces={row['bounce_count']} | categories={row['attack_categories']}\n"
+                    )
+                f.write("\n")
+
+            if investigation.get('rules'):
+                f.write("ГОТОВЫЕ ПРАВИЛА\n")
+                f.write("---------------\n")
+                for rule in investigation['rules']:
+                    f.write(f"[{rule['type']}] {rule['description']}\n{rule['rule']}\n\n")
+
+            security = investigation.get('security', {})
+            if security.get('mitre_matrix'):
+                f.write("МАТРИЦА УГРОЗ\n")
+                f.write("-------------\n")
+                for row in security['mitre_matrix'][:10]:
+                    f.write(
+                        f"{row['stage']} | {row['mitre_tactic']} | "
+                        f"events={row['events']} | risk={row['risk']} | {row['evidence']}\n"
+                    )
+                f.write("\n")
+
+            if security.get('successful_sensitive'):
+                f.write("ВОЗМОЖНЫЕ УСПЕШНЫЕ ОБРАЩЕНИЯ К ЧУВСТВИТЕЛЬНЫМ ПУТЯМ\n")
+                f.write("----------------------------------------------------\n")
+                for row in security['successful_sensitive'][:15]:
+                    f.write(
+                        f"{row['time'].strftime('%Y-%m-%d %H:%M:%S')} | {row['ip']} | "
+                        f"{row['status']} | {row['risk']} | {row['category']} | {row['url']} | "
+                        f"{row.get('interpretation', '')}\n"
+                    )
+                f.write("\n")
+
+            if security.get('payload_summary'):
+                f.write("PAYLOAD-ПАТТЕРНЫ\n")
+                f.write("----------------\n")
+                for row in security['payload_summary'][:10]:
+                    f.write(f"{row['payload_type']}: {row['count']}\n")
+                f.write("\n")
+
+            if security.get('manual_checklist'):
+                f.write("ЧЕКЛИСТ РУЧНОЙ ПРОВЕРКИ\n")
+                f.write("-----------------------\n")
+                for row in security['manual_checklist']:
+                    f.write(f"[{row['priority']}] {row['check']}\n")
+                    f.write(f"  Зачем: {row['why']}\n")
+                    f.write(f"  Как: {row['how']}\n")
+                f.write("\n")
 
         if bounce_analysis.get('daily_stats'):
             f.write("КРАТКИЙ ОБЗОР ПО ДАТАМ\n")
@@ -106,6 +179,56 @@ def run_ai_from_excel(excel_path: str, auth_key: str, cfg: Config) -> None:
     print(f"AI-отчёт сохранён: {ai_report_file}")
 
 
+def export_iocs(results_dir: Path, domain_slug: str, timestamp: str, investigation: dict) -> Path:
+    """Экспортирует IOC и готовые правила отдельными файлами для админа/SOC."""
+    export_dir = results_dir / f"{domain_slug}_iocs_{timestamp}"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    security = investigation.get('security', {})
+    iocs = security.get('iocs', {})
+    files = {
+        'blocklist_ips.txt': iocs.get('block_ips', []),
+        'monitor_ips.txt': iocs.get('monitor_ips', []),
+        'suspicious_user_agents.txt': iocs.get('user_agents', []),
+        'suspicious_paths.txt': iocs.get('paths', []),
+    }
+    for filename, rows in files.items():
+        with open(export_dir / filename, 'w', encoding='utf-8') as f:
+            for row in rows:
+                f.write(str(row) + '\n')
+
+    nginx_rules = []
+    iptables_rules = []
+    for rule in investigation.get('rules', []):
+        if rule.get('type') == 'nginx deny':
+            nginx_rules.append(rule.get('rule', ''))
+        elif rule.get('type') == 'iptables':
+            iptables_rules.append(rule.get('rule', ''))
+        elif rule.get('type', '').startswith('nginx'):
+            nginx_rules.append(rule.get('rule', ''))
+
+    with open(export_dir / 'nginx_security_rules.conf', 'w', encoding='utf-8') as f:
+        f.write('\n\n'.join(nginx_rules))
+        f.write('\n')
+
+    with open(export_dir / 'iptables_drop.sh', 'w', encoding='utf-8') as f:
+        f.write('#!/bin/sh\n')
+        f.write('\n'.join(iptables_rules))
+        f.write('\n')
+
+    with open(export_dir / 'ioc_summary.md', 'w', encoding='utf-8') as f:
+        f.write(f"# IOC Summary: {domain_slug}\n\n")
+        f.write(investigation.get('conclusion', '') + "\n\n")
+        f.write("## MITRE / Kill Chain\n\n")
+        for row in security.get('mitre_matrix', [])[:20]:
+            f.write(f"- {row['stage']} ({row['mitre_tactic']}): {row['events']} events, risk={row['risk']}\n")
+        f.write("\n## Possible Successful Sensitive Requests\n\n")
+        for row in security.get('successful_sensitive', [])[:30]:
+            f.write(f"- {row['time'].strftime('%Y-%m-%d %H:%M:%S')} {row['ip']} {row['status']} {row['risk']} {row['url']}\n")
+
+    return export_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description='Log Analyzer Pro')
     parser.add_argument('log_path', nargs='?', help='Path to access.log or directory (не нужен для --ai-report)')
@@ -118,7 +241,7 @@ def main():
     parser.add_argument('--ai-report', metavar='PATH', help='Run AI analysis on existing Excel report (no log parsing)')
     parser.add_argument('--auth-key', help='GigaChat auth key')
     parser.add_argument('--model', help='GigaChat model (e.g. GigaChat, GigaChat-Light)')
-    parser.add_argument('--format', choices=['excel', 'html', 'all'], default='excel', help='Report format')
+    parser.add_argument('--format', choices=['excel', 'html', 'pdf', 'all'], default='excel', help='Report format')
     parser.add_argument('--max-entries', type=int, default=None, metavar='N', help='Макс. число записей для анализа (для больших логов задайте и используйте --start-date/--end-date по частям)')
     parser.add_argument('--no-cache', action='store_true', help='Не сохранять распознанные логи на диск; каждый запуск парсит заново')
     parser.add_argument('--cache-dir', default=None, metavar='DIR', help='Папка кэша (по умолчанию: <лог_директория>/.log_analyz_cache)')
@@ -182,6 +305,7 @@ def main():
         window_minutes=cfg.get('analyzer.load_window_minutes'),
         threshold_percentile=cfg.get('analyzer.load_threshold_percentile')
     )
+    investigation = analyzer.build_investigation_report(bounce_analysis, suspicious_patterns, load_analysis)
     
     analyzer.print_summary(bounce_analysis, suspicious_patterns, load_analysis)
     
@@ -196,21 +320,28 @@ def main():
     
     report_file_excel = results_dir / f"{domain_slug}_report_{timestamp}.xlsx"
     
-    formats = [args.format] if args.format != 'all' else ['excel', 'html']
+    formats = [args.format] if args.format != 'all' else ['excel', 'html', 'pdf']
     
     if 'excel' in formats:
         # Convert path to string for compatibility with openpyxl/pandas if needed, though pathlib usually works
         reporter = ExcelReporter(str(report_file_excel))
-        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis)
+        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation)
         
     if 'html' in formats:
         reporter = HtmlReporter(str(report_file_excel))
-        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis)
+        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation)
+
+    if 'pdf' in formats:
+        reporter = PdfReporter(str(report_file_excel))
+        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation)
 
     # Краткий итоговый txt-отчёт
     summary_file_txt = results_dir / f"{domain_slug}_summary_{timestamp}.txt"
-    write_text_summary(summary_file_txt, analyzer, bounce_analysis, suspicious_patterns, load_analysis)
+    write_text_summary(summary_file_txt, analyzer, bounce_analysis, suspicious_patterns, load_analysis, investigation)
     print(f"Краткий txt-отчёт сохранён: {summary_file_txt}")
+
+    ioc_dir = export_iocs(results_dir, domain_slug, timestamp, investigation)
+    print(f"IOC и правила сохранены: {ioc_dir}")
     
     # AI Analysis (на основании таблицы — bounce_analysis, suspicious_patterns, load_analysis, не сырых логов)
     if args.ai or cfg.get('ai.enabled'):
