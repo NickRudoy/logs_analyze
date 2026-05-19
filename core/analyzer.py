@@ -36,6 +36,7 @@ class DirectTrafficAnalyzer:
         self.cache_dir = cache_dir
         self.entries = []
         self.direct_traffic_count = 0
+        self.google_traffic_count = 0
         self.bounce_session_keys = set()
         self.geo_analyzer = GeoIPAnalyzer(use_api=use_geoip, verbose=verbose) if use_geoip else None
         self.ua_analyzer = UserAgentAnalyzer()
@@ -169,6 +170,21 @@ class DirectTrafficAnalyzer:
         if any(resource in url for resource in ['/wp-content/', '/wp-includes/', '/wp-json/', '/wp-cron', '/wp-admin/', '.css', '.js', '.jpg', '.png', '.gif', '.ico', '.svg']):
             return False
         return True
+
+    def _is_google_referer(self, referer):
+        """Проверяет, что referer пришёл с домена google.* или его поддомена."""
+        if not referer or referer == '-':
+            return False
+        parsed = urlparse(referer)
+        host = (parsed.hostname or '').lower().strip('.')
+        if not host:
+            return False
+        labels = host.split('.')
+        return 'google' in labels and not host.endswith('googleusercontent.com')
+
+    def _is_google_entry(self, entry):
+        """Проверяет запрос с реферером Google."""
+        return self._is_google_referer(entry.get('referer', ''))
     
     def _flush_batch(self, batch, db_path):
         if not batch:
@@ -323,6 +339,103 @@ class DirectTrafficAnalyzer:
         print("\nОпределение прямого трафика...")
         self.direct_traffic_count = sum(1 for entry in self.entries if self._is_direct_entry(entry))
         print(f"Прямых заходов: {self.direct_traffic_count}")
+
+    def analyze_google_traffic(self):
+        """Анализирует трафик, у которого referer указывает на Google."""
+        print("\nАнализ трафика из Google...")
+
+        google_entries = [entry for entry in self.entries if self._is_google_entry(entry)]
+        self.google_traffic_count = len(google_entries)
+
+        daily_stats = defaultdict(lambda: {'total_requests': 0, 'google_requests': 0, 'bounces': 0})
+        for entry in self.entries:
+            day = entry['timestamp'].date().isoformat()
+            daily_stats[day]['total_requests'] += 1
+
+        sessions = defaultdict(lambda: {'entries': []})
+        referer_counter = Counter()
+        url_counter = Counter()
+        ip_counter = Counter()
+        status_counter = Counter()
+        samples = []
+
+        for entry in google_entries:
+            day = entry['timestamp'].date().isoformat()
+            daily_stats[day]['google_requests'] += 1
+            key = f"{entry['ip']}|{entry['user_agent']}"
+            sessions[key]['entries'].append(entry)
+            referer_counter[entry.get('referer', '-')] += 1
+            url_counter[entry.get('url', '-')] += 1
+            ip_counter[entry.get('ip', '-')] += 1
+            status_counter[entry.get('status', 0)] += 1
+            if len(samples) < 1000:
+                samples.append(entry)
+
+        session_timeout = timedelta(minutes=30)
+        session_entries = {}
+        for base_key, data in sessions.items():
+            current_session = []
+            session_index = 0
+            previous_ts = None
+            for entry in sorted(data['entries'], key=lambda e: e['timestamp']):
+                if previous_ts is not None and entry['timestamp'] - previous_ts > session_timeout:
+                    if current_session:
+                        session_entries[f"{base_key}|{session_index}"] = current_session
+                    session_index += 1
+                    current_session = []
+                current_session.append(entry)
+                previous_ts = entry['timestamp']
+            if current_session:
+                session_entries[f"{base_key}|{session_index}"] = current_session
+
+        bounce_sessions = {
+            k for k, entries in session_entries.items()
+            if sum(1 for entry in entries if entry['status'] == 200) <= 1
+        }
+        bounce_count = 0
+        for key in bounce_sessions:
+            entries = session_entries[key]
+            bounce_count += len(entries)
+            for entry in entries:
+                day = entry['timestamp'].date().isoformat()
+                daily_stats[day]['bounces'] += 1
+
+        daily_rows = []
+        for day in sorted(daily_stats.keys()):
+            d = daily_stats[day]
+            google_share = (d['google_requests'] / d['total_requests'] * 100) if d['total_requests'] else 0
+            bounce_rate = (d['bounces'] / d['google_requests'] * 100) if d['google_requests'] else 0
+            daily_rows.append({
+                'date': day,
+                'total_requests': d['total_requests'],
+                'google_requests': d['google_requests'],
+                'google_share': google_share,
+                'bounces': d['bounces'],
+                'bounce_rate': bounce_rate,
+            })
+
+        total_entries = len(self.entries)
+        google_share = (self.google_traffic_count / total_entries * 100) if total_entries else 0
+        bounce_rate = (bounce_count / self.google_traffic_count * 100) if self.google_traffic_count else 0
+
+        print(f"Запросов с Google referer: {self.google_traffic_count} ({google_share:.2f}% от всех записей)")
+        print(f"Google-сессий: {len(session_entries)}")
+        print(f"Отказов Google-трафика: {bounce_count} ({bounce_rate:.2f}%)")
+
+        return {
+            'total_google': self.google_traffic_count,
+            'google_share': google_share,
+            'sessions': len(session_entries),
+            'bounce_sessions': len(bounce_sessions),
+            'bounces': bounce_count,
+            'bounce_rate': bounce_rate,
+            'top_referers': referer_counter.most_common(50),
+            'top_urls': url_counter.most_common(50),
+            'top_ips': ip_counter.most_common(50),
+            'status_codes': status_counter.most_common(),
+            'daily_stats': daily_rows,
+            'sample_entries': samples,
+        }
         
     def analyze_bounce_rate(self):
         """Анализирует отказы (bounce rate)"""
@@ -1440,7 +1553,7 @@ class DirectTrafficAnalyzer:
         """Создает безопасное имя файла"""
         return re.sub(r'[^a-z0-9]+', '_', filename.lower()).strip('_')
 
-    def print_summary(self, bounce_analysis, suspicious_patterns, load_analysis):
+    def print_summary(self, bounce_analysis, suspicious_patterns, load_analysis, google_analysis=None):
         """Выводит сводку в консоль"""
         print("\n" + "="*50)
         print("СВОДКА")
@@ -1455,6 +1568,19 @@ class DirectTrafficAnalyzer:
         print(f"Bounce Rate: {bounce_analysis['bounce_rate']:.2f}%")
         print(f"Прямых сессий: {bounce_analysis.get('direct_sessions', 0)}")
         print(f"Сессий с отказом: {bounce_analysis.get('bounce_sessions', 0)}")
+
+        if google_analysis is not None:
+            print("\nGOOGLE TRAFFIC (REFERER GOOGLE)")
+            print(f"Запросов с Google referer: {google_analysis.get('total_google', 0)}")
+            print(f"Доля от всех запросов: {google_analysis.get('google_share', 0):.2f}%")
+            print(f"Google-сессий: {google_analysis.get('sessions', 0)}")
+            print(f"Отказов Google-трафика: {google_analysis.get('bounces', 0)}")
+            print(f"Bounce Rate Google-трафика: {google_analysis.get('bounce_rate', 0):.2f}%")
+            top_urls = google_analysis.get('top_urls', [])[:5]
+            if top_urls:
+                print("Топ URL из Google:")
+                for url, count in top_urls:
+                    print(f"  - {url}: {count}")
         
         print("\nПОДОЗРИТЕЛЬНАЯ АКТИВНОСТЬ")
         suspicious_ips = suspicious_patterns['suspicious_ips']

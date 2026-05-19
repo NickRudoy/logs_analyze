@@ -130,7 +130,7 @@ class ExcelReporter:
     def __init__(self, output_path):
         self.output_path = output_path
         
-    def generate(self, bounce_analysis, suspicious_patterns, load_analysis=None, summary_extra=None, investigation=None):
+    def generate(self, bounce_analysis, suspicious_patterns, load_analysis=None, summary_extra=None, investigation=None, google_analysis=None):
         """Генерирует Excel отчет"""
         print(f"\nГенерация отчета: {self.output_path}")
         
@@ -144,6 +144,11 @@ class ExcelReporter:
                     'Процент отказов (%)',
                     'Прямых сессий',
                     'Сессий с отказом',
+                    'Запросов с Google referer',
+                    'Доля Google referer (%)',
+                    'Google-сессий',
+                    'Отказов Google-трафика',
+                    'Bounce Rate Google-трафика (%)',
                 ],
                 'Значение': [
                     bounce_analysis['total_direct'],
@@ -152,6 +157,11 @@ class ExcelReporter:
                     f"{bounce_analysis['bounce_rate']:.2f}%",
                     bounce_analysis.get('direct_sessions', 0),
                     bounce_analysis.get('bounce_sessions', 0),
+                    google_analysis.get('total_google', 0) if google_analysis else 0,
+                    f"{google_analysis.get('google_share', 0):.2f}%" if google_analysis else "0.00%",
+                    google_analysis.get('sessions', 0) if google_analysis else 0,
+                    google_analysis.get('bounces', 0) if google_analysis else 0,
+                    f"{google_analysis.get('bounce_rate', 0):.2f}%" if google_analysis else "0.00%",
                 ]
             }
             
@@ -359,6 +369,51 @@ class ExcelReporter:
                         'Процент отказов (%)': f"{row['bounce_rate']:.2f}%"
                     })
                 pd.DataFrame(daily_data).to_excel(writer, sheet_name='Обзор по датам', index=False)
+
+            if google_analysis:
+                if google_analysis.get('daily_stats'):
+                    google_daily_data = []
+                    for row in google_analysis['daily_stats']:
+                        google_daily_data.append({
+                            'Дата': row['date'],
+                            'Всего запросов': row['total_requests'],
+                            'Запросов с Google referer': row['google_requests'],
+                            'Доля Google referer (%)': f"{row['google_share']:.2f}%",
+                            'Отказов Google-трафика': row['bounces'],
+                            'Bounce Rate Google-трафика (%)': f"{row['bounce_rate']:.2f}%"
+                        })
+                    pd.DataFrame(google_daily_data).to_excel(writer, sheet_name='Google по датам', index=False)
+
+                if google_analysis.get('top_urls'):
+                    pd.DataFrame([
+                        {'URL': url, 'Количество запросов': count}
+                        for url, count in google_analysis['top_urls']
+                    ]).to_excel(writer, sheet_name='Google URL', index=False)
+
+                if google_analysis.get('top_referers'):
+                    pd.DataFrame([
+                        {'Referer': referer, 'Количество запросов': count}
+                        for referer, count in google_analysis['top_referers']
+                    ]).to_excel(writer, sheet_name='Google referers', index=False)
+
+                if google_analysis.get('top_ips'):
+                    pd.DataFrame([
+                        {'IP': ip, 'Количество запросов': count}
+                        for ip, count in google_analysis['top_ips']
+                    ]).to_excel(writer, sheet_name='Google IP', index=False)
+
+                if google_analysis.get('sample_entries'):
+                    google_samples = []
+                    for entry in google_analysis['sample_entries'][:1000]:
+                        google_samples.append({
+                            'IP': entry['ip'],
+                            'User-Agent': entry['user_agent'],
+                            'URL': entry['url'],
+                            'Статус': entry['status'],
+                            'Referer': entry['referer'],
+                            'Время': entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                        })
+                    pd.DataFrame(google_samples).to_excel(writer, sheet_name='Google детали', index=False)
             
             # Подозрительные IP
             if suspicious_patterns.get('suspicious_ips'):

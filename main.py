@@ -6,13 +6,15 @@ from datetime import datetime
 
 from config import Config
 from core.analyzer import DirectTrafficAnalyzer
+from core.error_analyzer import ErrorLogAnalyzer
+from report.error import ErrorExcelReporter, write_error_text_summary
 from report.excel import ExcelReporter, load_excel_for_ai
 from report.html import HtmlReporter
 from report.pdf import PdfReporter
 from ai.gigachat import GigaChatAnalyzer
 
 
-def write_text_summary(output_path: Path, analyzer: DirectTrafficAnalyzer, bounce_analysis: dict, suspicious_patterns: dict, load_analysis: dict, investigation: dict = None) -> None:
+def write_text_summary(output_path: Path, analyzer: DirectTrafficAnalyzer, bounce_analysis: dict, suspicious_patterns: dict, load_analysis: dict, investigation: dict = None, google_analysis: dict = None) -> None:
     """Сохраняет краткий текстовый итог анализа."""
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("LOG ANALYSIS SUMMARY\n")
@@ -24,6 +26,12 @@ def write_text_summary(output_path: Path, analyzer: DirectTrafficAnalyzer, bounc
         f.write(f"Bounce Rate: {bounce_analysis['bounce_rate']:.2f}%\n")
         f.write(f"Прямых сессий: {bounce_analysis.get('direct_sessions', 0):,}\n")
         f.write(f"Сессий с отказом: {bounce_analysis.get('bounce_sessions', 0):,}\n")
+        if google_analysis:
+            f.write(f"Запросов с Google referer: {google_analysis.get('total_google', 0):,}\n")
+            f.write(f"Доля Google referer: {google_analysis.get('google_share', 0):.2f}%\n")
+            f.write(f"Google-сессий: {google_analysis.get('sessions', 0):,}\n")
+            f.write(f"Отказов Google-трафика: {google_analysis.get('bounces', 0):,}\n")
+            f.write(f"Bounce Rate Google-трафика: {google_analysis.get('bounce_rate', 0):.2f}%\n")
         f.write(f"Подозрительных IP: {len(suspicious_patterns.get('suspicious_ips', []))}\n")
         if investigation and not investigation.get('geoip_enabled', True):
             f.write("IP из датацентров: GeoIP отключён\n")
@@ -109,6 +117,27 @@ def write_text_summary(output_path: Path, analyzer: DirectTrafficAnalyzer, bounc
                     f"bounce={row['bounces']:,}, "
                     f"rate={row['bounce_rate']:.2f}%\n"
                 )
+            f.write("\n")
+
+        if google_analysis:
+            f.write("GOOGLE TRAFFIC (REFERER GOOGLE)\n")
+            f.write("-------------------------------\n")
+            for row in google_analysis.get('daily_stats', []):
+                f.write(
+                    f"{row['date']}: "
+                    f"google={row['google_requests']:,}, "
+                    f"share={row['google_share']:.2f}%, "
+                    f"bounce={row['bounces']:,}, "
+                    f"rate={row['bounce_rate']:.2f}%\n"
+                )
+            if google_analysis.get('top_urls'):
+                f.write("\nТоп URL из Google:\n")
+                for url, count in google_analysis['top_urls'][:10]:
+                    f.write(f"{count:,} | {url}\n")
+            if google_analysis.get('top_referers'):
+                f.write("\nТоп Google referer:\n")
+                for referer, count in google_analysis['top_referers'][:10]:
+                    f.write(f"{count:,} | {referer}\n")
             f.write("\n")
 
         top_suspicious = sorted(
@@ -229,9 +258,40 @@ def export_iocs(results_dir: Path, domain_slug: str, timestamp: str, investigati
     return export_dir
 
 
+def run_error_analysis(args, cfg: Config) -> None:
+    """Запускает отдельный анализ nginx/php error-логов."""
+    start_date = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
+    end_date = datetime.strptime(args.end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59) if args.end_date else None
+
+    analyzer = ErrorLogAnalyzer(
+        log_path=args.log_path,
+        domain=args.domain,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    analyzer.parse_logs()
+    analyzer.ensure_domain()
+    analysis = analyzer.analyze()
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    domain_slug = analyzer._slugify_filename(analyzer.domain or 'site')
+    results_dir = Path("results") / domain_slug
+    results_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nРезультаты error-анализа будут сохранены в папку: {results_dir}")
+
+    report_file_excel = results_dir / f"{domain_slug}_error_report_{timestamp}.xlsx"
+    ErrorExcelReporter(str(report_file_excel)).generate(analysis)
+
+    summary_file_txt = results_dir / f"{domain_slug}_error_summary_{timestamp}.txt"
+    write_error_text_summary(summary_file_txt, analyzer, analysis)
+    print(f"Краткий error txt-отчёт сохранён: {summary_file_txt}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Log Analyzer Pro')
     parser.add_argument('log_path', nargs='?', help='Path to access.log or directory (не нужен для --ai-report)')
+    parser.add_argument('--mode', choices=['access', 'error'], default='access', help='Режим анализа: access-логи или error-логи')
+    parser.add_argument('--error-analysis', action='store_true', help='Alias для --mode error')
     parser.add_argument('--domain', default='auto', help='Target domain')
     parser.add_argument('--start-date', help='YYYY-MM-DD')
     parser.add_argument('--end-date', help='YYYY-MM-DD')
@@ -278,6 +338,13 @@ def main():
         cfg.config['ai']['auth_key'] = args.auth_key
     if args.model:
         cfg.config['ai']['model'] = args.model
+
+    if args.error_analysis:
+        args.mode = 'error'
+
+    if args.mode == 'error':
+        run_error_analysis(args, cfg)
+        return
     
     start_date = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
     end_date = datetime.strptime(args.end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59) if args.end_date else None
@@ -297,6 +364,7 @@ def main():
     analyzer.parse_logs()
     analyzer.ensure_domain()
     analyzer.identify_direct_traffic()
+    google_analysis = analyzer.analyze_google_traffic()
     bounce_analysis = analyzer.analyze_bounce_rate()
     suspicious_patterns = analyzer.find_suspicious_patterns(bounce_analysis)
     
@@ -307,7 +375,7 @@ def main():
     )
     investigation = analyzer.build_investigation_report(bounce_analysis, suspicious_patterns, load_analysis)
     
-    analyzer.print_summary(bounce_analysis, suspicious_patterns, load_analysis)
+    analyzer.print_summary(bounce_analysis, suspicious_patterns, load_analysis, google_analysis)
     
     # Generate Report
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -325,19 +393,23 @@ def main():
     if 'excel' in formats:
         # Convert path to string for compatibility with openpyxl/pandas if needed, though pathlib usually works
         reporter = ExcelReporter(str(report_file_excel))
-        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation)
+        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation, google_analysis=google_analysis)
         
     if 'html' in formats:
         reporter = HtmlReporter(str(report_file_excel))
-        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation)
+        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation, google_analysis=google_analysis)
 
     if 'pdf' in formats:
         reporter = PdfReporter(str(report_file_excel))
-        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation)
+        reporter.generate(bounce_analysis, suspicious_patterns, load_analysis, investigation=investigation, summary_extra={
+            'Запросов с Google referer': google_analysis.get('total_google', 0),
+            'Доля Google referer': f"{google_analysis.get('google_share', 0):.2f}%",
+            'Google Bounce Rate': f"{google_analysis.get('bounce_rate', 0):.2f}%",
+        })
 
     # Краткий итоговый txt-отчёт
     summary_file_txt = results_dir / f"{domain_slug}_summary_{timestamp}.txt"
-    write_text_summary(summary_file_txt, analyzer, bounce_analysis, suspicious_patterns, load_analysis, investigation)
+    write_text_summary(summary_file_txt, analyzer, bounce_analysis, suspicious_patterns, load_analysis, investigation, google_analysis)
     print(f"Краткий txt-отчёт сохранён: {summary_file_txt}")
 
     ioc_dir = export_iocs(results_dir, domain_slug, timestamp, investigation)
@@ -358,7 +430,10 @@ def main():
                     'Всего записей в логе': len(analyzer.entries),
                     'Прямых заходов': bounce_analysis['total_direct'],
                     'Отказов': bounce_analysis['bounces'],
-                    'Процент отказов (%)': f"{bounce_analysis['bounce_rate']:.2f}%"
+                    'Процент отказов (%)': f"{bounce_analysis['bounce_rate']:.2f}%",
+                    'Запросов с Google referer': google_analysis.get('total_google', 0),
+                    'Доля Google referer (%)': f"{google_analysis.get('google_share', 0):.2f}%",
+                    'Google Bounce Rate (%)': f"{google_analysis.get('bounce_rate', 0):.2f}%"
                 },
                 'suspicious_ips': suspicious_patterns['suspicious_ips'],
                 'country_stats': [{'country': k, 'count': v['count']} for k, v in suspicious_patterns['country_stats'].items()],

@@ -16,7 +16,7 @@ class PdfReporter:
     def generate(self, bounce_analysis, suspicious_patterns, load_analysis=None, investigation=None, summary_extra=None):
         print(f"\nГенерация PDF отчета: {self.output_path}")
         try:
-            self._write_reportlab_pdf(bounce_analysis, suspicious_patterns, load_analysis, investigation)
+            self._write_reportlab_pdf(bounce_analysis, suspicious_patterns, load_analysis, investigation, summary_extra)
         except Exception as reportlab_exc:
             print(f"ReportLab PDF недоступен, пробуем HTML->PDF: {reportlab_exc}")
             html_content = self._build_html(bounce_analysis, suspicious_patterns, load_analysis, investigation, summary_extra)
@@ -24,11 +24,11 @@ class PdfReporter:
                 self._html_to_pdf(html_content)
             except Exception as html_exc:
                 print(f"HTML->PDF недоступен, используем встроенный PDF renderer: {html_exc}")
-                self._write_simple_pdf(bounce_analysis, suspicious_patterns, load_analysis, investigation)
+                self._write_simple_pdf(bounce_analysis, suspicious_patterns, load_analysis, investigation, summary_extra)
         print(f"PDF отчет сохранен: {self.output_path}")
         return self.output_path
 
-    def _write_reportlab_pdf(self, bounce_analysis, suspicious_patterns, load_analysis, investigation):
+    def _write_reportlab_pdf(self, bounce_analysis, suspicious_patterns, load_analysis, investigation, summary_extra=None):
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_CENTER
         from reportlab.lib.pagesizes import A4
@@ -102,6 +102,15 @@ class PdfReporter:
             ["Bounce Rate", f"{bounce_analysis.get('bounce_rate', 0):.2f}%", "Подозрительные IP", str(len(suspicious_patterns.get("suspicious_ips", [])))],
             ["Аномалии", str(anomaly_count), "Высокая нагрузка", str(high_load_count)],
         ]
+        if summary_extra:
+            extra_items = list(summary_extra.items())
+            for i in range(0, len(extra_items), 2):
+                left_key, left_value = extra_items[i]
+                if i + 1 < len(extra_items):
+                    right_key, right_value = extra_items[i + 1]
+                else:
+                    right_key, right_value = "", ""
+                metrics.append([str(left_key), str(left_value), str(right_key), str(right_value)])
         story.append(self._rl_table(metrics, [34 * mm, 38 * mm, 40 * mm, 38 * mm], font_size=9, header=False))
 
         if investigation.get("conclusion"):
@@ -444,12 +453,12 @@ class PdfReporter:
             except OSError:
                 pass
 
-    def _write_simple_pdf(self, bounce_analysis, suspicious_patterns, load_analysis, investigation):
-        lines = self._build_plain_lines(bounce_analysis, suspicious_patterns, load_analysis, investigation or {})
+    def _write_simple_pdf(self, bounce_analysis, suspicious_patterns, load_analysis, investigation, summary_extra=None):
+        lines = self._build_plain_lines(bounce_analysis, suspicious_patterns, load_analysis, investigation or {}, summary_extra)
         writer = _SimpleUnicodePdf(self.output_path)
         writer.write(lines)
 
-    def _build_plain_lines(self, bounce_analysis, suspicious_patterns, load_analysis, investigation):
+    def _build_plain_lines(self, bounce_analysis, suspicious_patterns, load_analysis, investigation, summary_extra=None):
         security = investigation.get("security", {})
         contrib = investigation.get("bounce_contribution", {})
         lines = [
@@ -461,6 +470,9 @@ class PdfReporter:
             ("p", f"Bounce Rate: {bounce_analysis.get('bounce_rate', 0):.2f}%"),
             ("p", f"Подозрительные IP: {len(suspicious_patterns.get('suspicious_ips', []))}"),
         ]
+        if summary_extra:
+            for key, value in summary_extra.items():
+                lines.append(("p", f"{key}: {value}"))
         if load_analysis:
             lines.extend([
                 ("p", f"Периоды высокой нагрузки: {len(load_analysis.get('high_load_periods', []))}"),

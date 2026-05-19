@@ -8,7 +8,7 @@ class HtmlReporter:
     def __init__(self, output_path):
         self.output_path = output_path.replace('.xlsx', '.html')
         
-    def generate(self, bounce_analysis, suspicious_patterns, load_analysis=None, summary_extra=None, investigation=None):
+    def generate(self, bounce_analysis, suspicious_patterns, load_analysis=None, summary_extra=None, investigation=None, google_analysis=None):
         """Генерирует HTML отчет"""
         print(f"\nГенерация HTML отчета: {self.output_path}")
 
@@ -24,6 +24,13 @@ class HtmlReporter:
             ('Прямых сессий', bounce_analysis.get('direct_sessions', 0)),
             ('Сессий с отказом', bounce_analysis.get('bounce_sessions', 0)),
         ]
+
+        if google_analysis:
+            summary_rows.extend([
+                ('Запросов с Google referer', google_analysis.get('total_google', 0)),
+                ('Доля Google referer', f"{google_analysis.get('google_share', 0):.2f}%"),
+                ('Google Bounce Rate', f"{google_analysis.get('bounce_rate', 0):.2f}%"),
+            ])
         
         if summary_extra:
             for k, v in summary_extra.items():
@@ -79,6 +86,48 @@ class HtmlReporter:
         html_content += """
                 </div>
         """
+
+        if google_analysis:
+            html_content += f"""
+                <h2>Google traffic (referer Google)</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Метрика</th>
+                            <th>Значение</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>Запросов с Google referer</td><td>{esc(google_analysis.get('total_google', 0))}</td></tr>
+                        <tr><td>Доля от всех запросов</td><td>{google_analysis.get('google_share', 0):.2f}%</td></tr>
+                        <tr><td>Google-сессий</td><td>{esc(google_analysis.get('sessions', 0))}</td></tr>
+                        <tr><td>Отказов Google-трафика</td><td>{esc(google_analysis.get('bounces', 0))}</td></tr>
+                        <tr><td>Bounce Rate Google-трафика</td><td>{google_analysis.get('bounce_rate', 0):.2f}%</td></tr>
+                    </tbody>
+                </table>
+            """
+
+            if google_analysis.get('top_urls'):
+                html_content += """
+                <h3>Топ URL из Google</h3>
+                <table>
+                    <thead><tr><th>URL</th><th>Запросов</th></tr></thead>
+                    <tbody>
+                """
+                for url, count in google_analysis['top_urls'][:20]:
+                    html_content += f"<tr><td>{esc(url)}</td><td>{esc(count)}</td></tr>"
+                html_content += "</tbody></table>"
+
+            if google_analysis.get('top_referers'):
+                html_content += """
+                <h3>Топ Google referer</h3>
+                <table>
+                    <thead><tr><th>Referer</th><th>Запросов</th></tr></thead>
+                    <tbody>
+                """
+                for referer, count in google_analysis['top_referers'][:20]:
+                    html_content += f"<tr><td>{esc(referer)}</td><td>{esc(count)}</td></tr>"
+                html_content += "</tbody></table>"
 
         if investigation:
             contrib = investigation.get('bounce_contribution', {})

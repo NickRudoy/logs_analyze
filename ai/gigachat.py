@@ -6,12 +6,39 @@ from typing import Dict, Any, List
 
 HAS_GIGACHAT = False
 
+# Маппинг имён моделей: опечатки и альтернативы → корректный ID для API
+# API gigachat.devices.sberbank.ru (2026): GigaChat 2 Max, GigaChat 2 Pro, GigaChat 2 Lite
+# Документация: https://developers.sber.ru/docs/ru/gigachat/models/main
+MODEL_ALIASES = {
+    # Lite (подписка: GigaChat Lite)
+    "gigachat-light": "GigaChat-2",   # Light → Lite (опечатка)
+    "gigachat light": "GigaChat-2",
+    "gigachat lite": "GigaChat-2",
+    "gigachat-lite": "GigaChat-2",
+    "gigachat-2-lite": "GigaChat-2",
+    # Pro (подписка: GigaChat Pro)
+    "gigachat-pro": "GigaChat-2-Pro",
+    "gigachat pro": "GigaChat-2-Pro",
+    "gigachat-2-pro": "GigaChat-2-Pro",
+    # Max (подписка: GigaChat Max)
+    "gigachat-max": "GigaChat-2-Max",
+    "gigachat max": "GigaChat-2-Max",
+    "gigachat-2-max": "GigaChat-2-Max",
+}
+
+
+def _normalize_model(model: str) -> str:
+    """Приводит название модели к формату, ожидаемому API."""
+    key = model.strip().lower()
+    return MODEL_ALIASES.get(key, model.strip())
+
+
 class GigaChatAnalyzer:
     """Анализатор с использованием GigaChat API"""
     
     def __init__(self, auth_key: str, model: str = "GigaChat", verify_ssl: bool = False):
         self.auth_key = auth_key
-        self.model = model
+        self.model = _normalize_model(model)
         self.verify_ssl = verify_ssl
         self.client = None
         self.initialize_client()
@@ -151,6 +178,36 @@ IP ИЗ ДАТАЦЕНТРОВ:
 
         return self._send_request(prompt)
     
+    def get_ips_to_block(self, context: Dict[str, Any], threat_analysis: str) -> str:
+        """Формирует список IP-адресов, рекомендуемых для блокировки"""
+        print("Формирование списка IP для блокировки...")
+        
+        suspicious_ips = context.get('suspicious_ips', [])
+        datacenter_ips = context.get('datacenter_ips', [])
+        
+        prompt = f"""На основе анализа угроз и данных о подозрительной активности сформируй КОНКРЕТНЫЙ список IP-адресов для блокировки.
+
+АНАЛИЗ УГРОЗ:
+{threat_analysis}
+
+ПОДОЗРИТЕЛЬНЫЕ IP (из отчёта):
+{json.dumps(suspicious_ips[:15], ensure_ascii=False, indent=2)}
+
+IP ИЗ ДАТАЦЕНТРОВ:
+{json.dumps(datacenter_ips[:10], ensure_ascii=False, indent=2)}
+
+Формат ответа — ТОЛЬКО список, по одному IP на строку, в формате:
+IP_АДРЕС — краткая причина (страна, тип активности)
+
+Пример:
+192.168.1.1 — Россия, сканирование уязвимостей
+10.0.0.5 — Датацентр, бот
+
+Список должен быть приоритизирован: сначала самые опасные. Укажи 5-20 IP в зависимости от данных.
+Если данных недостаточно — напиши «Данных для составления списка недостаточно»."""
+
+        return self._send_request(prompt)
+
     def create_executive_summary(self, threat_analysis: str, recommendations: str, business_impact: str) -> str:
         """Создает краткую сводку для руководства"""
         print("Создание executive summary...")
